@@ -1,0 +1,51 @@
+# HPC job outputs
+*.err
+*.out
+*.log
+
+# plots
+*.png
+*.jpg
+*.jpeg
+*.pdf
+*.svg
+
+# python cache
+__pycache__/
+*.pyc
+
+# virtual environments
+venv/
+.venv/
+.env/
+
+# build / packaging
+build/
+dist/
+*.egg-info/
+
+# notebooks
+.ipynb_checkpoints/
+
+# data files
+*.h5ad
+*.h5
+*.loom
+*.zarr
+*.mtx
+*.npz
+*.npy
+
+# temp files
+tmp/
+temp/
+*.tmp
+
+# editors / IDE
+*.swp
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
