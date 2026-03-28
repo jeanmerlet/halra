@@ -40,6 +40,7 @@ dist/
 tmp/
 temp/
 *.tmp
+test.py
 
 # editors / IDE
 *.swp
