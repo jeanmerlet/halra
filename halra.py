@@ -2,33 +2,71 @@ import numpy as np
 import scipy.sparse as sp
 from sklearn.utils.extmath import randomized_svd
 
-def log_normalize_counts(mtx, scale_factor=1e4):
-    # ensure sparse CSR
+
+def ensure_csr(mtx):
     if isinstance(mtx, np.ndarray):
-        mtx = sp.csr_matrix(mtx)
-    elif not sp.issparse(mtx):
-        raise TypeError("Input must be numpy.ndarray or scipy.sparse matrix")
+        return sp.csr_matrix(mtx)
+    elif sp.issparse(mtx):
+        return mtx.tocsr()
     else:
-        mtx = mtx.tocsr()
-    # remove zero-sum cols
+        raise TypeError("Input must be numpy.ndarray or scipy.sparse matrix")
+
+
+def remove_zero_genes_cells(mtx):
+    # genes (columns)
     col_sums = np.asarray(mtx.sum(axis=0)).ravel()
-    keep = col_sums > 0
-    n_omit = np.sum(~keep)
-    if n_omit > 0: print(f"Omitted {n_omit} genes with zero counts")
-    mtx = mtx[:, keep]
-    # remove zero-sum rows
+    keep_cols = col_sums > 0
+    n_omit = np.sum(~keep_cols)
+    if n_omit > 0:
+        print(f"Omitted {n_omit} genes with zero counts")
+    mtx = mtx[:, keep_cols]
+
+    # cells (rows)
     row_sums = np.asarray(mtx.sum(axis=1)).ravel()
-    keep = row_sums > 0
-    n_omit = np.sum(~keep)
-    if n_omit > 0: print(f"Omitted {n_omit} cells with zero counts")
-    mtx = mtx[keep, :]
-    row_sums = row_sums[keep]
-    # normalize + scale
+    keep_rows = row_sums > 0
+    n_omit = np.sum(~keep_rows)
+    if n_omit > 0:
+        print(f"Omitted {n_omit} cells with zero counts")
+    mtx = mtx[keep_rows, :]
+
+    return mtx, row_sums[keep_rows]
+
+
+def normalize_total(mtx, row_sums, scale_factor=1e4):
     inv_row_sums = 1.0 / row_sums
-    mtx = mtx.multiply(inv_row_sums[:, None]) * scale_factor
-    # log1p transform (preserve sparsity)
+    return mtx.multiply(inv_row_sums[:, None]) * scale_factor
+
+
+def log1p_sparse(mtx):
     mtx.data = np.log1p(mtx.data)
     return mtx
+
+
+def log_normalize_counts(mtx, scale_factor=1e4):
+    mtx = ensure_csr(mtx)
+    mtx, row_sums = remove_zero_genes_cells(mtx)
+    mtx = normalize_total(mtx, row_sums, scale_factor)
+    mtx = log1p_sparse(mtx)
+    return mtx
+
+
+def choose_rank(mtx, n_iter, seed, n_comps=100, thresh=6, noise_start=80):
+    if n_comps >= min(mtx.shape):
+        raise ValueError("n_comps must be smaller than the smallest dimension of mtx.")
+    if noise_start > n_comps - 5:
+        raise ValueError("There need to be at least 5 singular values considered noise.")
+
+    noise_svals = np.arange(noise_start, n_comps)
+    _, s, _ = randomized_svd(mtx, n_components=n_comps, n_iter=n_iter, random_state=seed)
+
+    diffs = s[:-1] - s[1:]
+    mu = np.mean(diffs[noise_svals - 1])
+    sigma = np.std(diffs[noise_svals - 1])
+    n_std_devs = (diffs - mu) / sigma
+    rank = np.max(np.where(n_std_devs > thresh)[0]) + 1
+    print(f"Chose rank={rank}")
+    return rank
+
 
 def sparse_col_std_nnz(mtx):
     mtx = mtx.tocsc()
@@ -40,6 +78,7 @@ def sparse_col_std_nnz(mtx):
             out[j] = np.std(vals)
     return out
 
+
 def sparse_col_mean_nnz(mtx):
     mtx = mtx.tocsc()
     out = np.full(mtx.shape[1], 0.0, dtype=float)
@@ -50,87 +89,114 @@ def sparse_col_mean_nnz(mtx):
             out[j] = np.mean(vals)
     return out
 
-def choose_rank(mtx, n_iter, seed, n_comps=100, thresh=6, noise_start=80):
-    # mtx: scipy.sparse csr mtx
-    if n_comps >= min(mtx.shape):
-        raise ValueError("n_comps must be smaller than the smallest dimension of mtx.")
-    if noise_start > n_comps - 5:
-        raise ValueError("There need to be at least 5 singular values considered noise.")
-    noise_svals = np.arange(noise_start, n_comps)
-    u, s, vh = randomized_svd(mtx, n_components=n_comps, n_iter=n_iter,
-                              random_state=seed)
-    # Calculate the differences between consecutive singular values
-    diffs = s[:-1] - s[1:]
-    # Calculate mean and standard deviation of noise singular value differences
-    mu = np.mean(diffs[noise_svals - 1])
-    sigma = np.std(diffs[noise_svals - 1])
-    # Calculate the number of standard deviations from the mean
-    n_std_devs = (diffs - mu) / sigma
-    # Find the largest k where n_std_devs exceeds the threshold
-    rank = np.max(np.where(n_std_devs > thresh)[0]) + 1
-    return rank
 
 def std_dev_nnz(x):
     vals = x[x != 0]
-    return np.std(vals) if vals.size > 0 else 0
+    return np.std(vals) if vals.size > 0 else 0.0
+
 
 def mean_nnz(x):
     vals = x[x != 0]
-    return np.mean(vals) if vals.size > 0 else 0
+    return np.mean(vals) if vals.size > 0 else 0.0
 
-def halra(mtx, rank=0, n_iter=12, quantile_prob=0.001, seed=1):
-    n_row, n_col = mtx.shape
-    # visual check for cell x gene for user
-    print(f"Read matrix with {n_row} cells and {n_col} genes")
 
-    # find rank if unspecified or 0
-    if rank == 0:
-        rank = choose_rank(mtx, n_iter, seed)
-        print(f"Chose rank={rank}")
-    u, s, vh = randomized_svd(mtx, n_components=rank, n_iter=n_iter,
-                              random_state=seed)
+def compute_low_rank_reconstruction(mtx, rank, n_iter, seed):
+    print("Computing low-rank reconstruction")
+    u, s, vh = randomized_svd(mtx, n_components=rank, n_iter=n_iter, random_state=seed)
+    recon_mtx = u @ np.diag(s) @ vh
+    return recon_mtx
 
-    rank_mtx = np.dot(u[:, :rank], np.dot(np.diag(s[:rank]), vh[:rank, :]))
-    print(f"Find the {quantile_prob} quantile of each gene")
-    rank_mtx_mins = np.abs(np.quantile(rank_mtx, quantile_prob, axis=0))
-    print("Sweep")
-    condition = rank_mtx <= rank_mtx_mins[np.newaxis, :]
-    rank_mtx_cor = np.where(condition, 0, rank_mtx)
-    mtx = mtx.tocsc()
-    print(type(std_dev_nnz), type(rank_mtx_cor), type(mtx))
-    sigma_1 = np.apply_along_axis(std_dev_nnz, 0, rank_mtx_cor)
+
+def threshold_reconstruction(recon_mtx, quantile_prob):
+    print("Thresholding")
+    recon_mtx_mins = np.abs(np.quantile(recon_mtx, quantile_prob, axis=0))
+    condition = recon_mtx <= recon_mtx_mins[np.newaxis, :]
+    thresh_mtx = np.where(condition, 0, recon_mtx)
+    return thresh_mtx
+
+
+def compute_scaling_factors(thresh_mtx, mtx):
+    print("Computing scaling factors")
+    sigma_1 = np.apply_along_axis(std_dev_nnz, 0, thresh_mtx)
     sigma_2 = sparse_col_std_nnz(mtx)
-    mu_1 = np.sum(rank_mtx_cor, axis=0) / np.sum(rank_mtx_cor != 0, axis=0)
+
+    nnz_1 = np.sum(thresh_mtx != 0, axis=0)
+    mu_1 = np.divide(
+        np.sum(thresh_mtx, axis=0),
+        nnz_1,
+        out=np.zeros(thresh_mtx.shape[1], dtype=float),
+        where=nnz_1 != 0
+    )
     mu_2 = sparse_col_mean_nnz(mtx)
-    to_scale = (~np.isnan(sigma_1)) & (~np.isnan(sigma_2)) & ~((sigma_1 == 0) & (sigma_2 == 0)) & (sigma_1 != 0)
 
+    to_scale = (
+        (~np.isnan(sigma_1))
+        & (~np.isnan(sigma_2))
+        & ~((sigma_1 == 0) & (sigma_2 == 0))
+        & (sigma_1 != 0)
+    )
+
+    sigma_1_2 = np.divide(
+        sigma_2,
+        sigma_1,
+        out=np.zeros_like(sigma_2, dtype=float),
+        where=sigma_1 != 0
+    )
+    to_add = -mu_1 * sigma_1_2 + mu_2
+    return to_scale, sigma_1_2, to_add
+
+
+def scale_thresholded_matrix(thresh_mtx, to_scale, sigma_1_2, to_add):
     print(f"Scaling all except for {np.sum(~to_scale)} columns")
-    sigma_1_2 = sigma_2 / sigma_1
-    to_add = -mu_1 * sigma_2 / sigma_1 + mu_2
+    recon_mtx_tmp = thresh_mtx[:, to_scale]
+    recon_mtx_tmp = recon_mtx_tmp * sigma_1_2[to_scale]
+    recon_mtx_tmp = recon_mtx_tmp + to_add[to_scale]
 
-    rank_mtx_tmp = rank_mtx_cor[:, to_scale]
-    rank_mtx_tmp = rank_mtx_tmp * sigma_1_2[to_scale]
-    rank_mtx_tmp = rank_mtx_tmp + to_add[to_scale]
+    imputed_mtx = thresh_mtx.copy()
+    imputed_mtx[:, to_scale] = recon_mtx_tmp
+    imputed_mtx[thresh_mtx == 0] = 0
+    return imputed_mtx
 
-    rank_mtx_cor_sc = rank_mtx_cor.copy()
-    rank_mtx_cor_sc[:, to_scale] = rank_mtx_tmp
-    rank_mtx_cor_sc[rank_mtx_cor == 0] = 0
 
-    # set negative values to 0
-    neg = rank_mtx_cor_sc < 0
-    rank_mtx_cor_sc[neg] = 0
-    pct_neg = round(100 * np.sum(neg) / rank_mtx_cor_sc.size, 2)
-    print(f"{pct_neg} of the values became negative in the scaling process and were set to zero.")
+def zero_negatives(imputed_mtx):
+    neg = imputed_mtx < 0
+    imputed_mtx[neg] = 0
+    pct_neg = round(100 * np.sum(neg) / imputed_mtx.size, 2)
+    print(f"{pct_neg}% of the values became negative in the scaling process and were set to zero.")
+    return imputed_mtx
 
-    # restore originally observed nonzero values that are zero in the imputed matrix
+
+def restore_observed_values(imputed_mtx, mtx):
     coo = mtx.tocoo()
-    restore = rank_mtx_cor_sc[coo.row, coo.col] == 0
-    rank_mtx_cor_sc[coo.row[restore], coo.col[restore]] = coo.data[restore]
+    restore = imputed_mtx[coo.row, coo.col] == 0
+    imputed_mtx[coo.row[restore], coo.col[restore]] = coo.data[restore]
+    return imputed_mtx
 
-    print(type(mtx), type(rank_mtx_cor_sc))
+
+def report_density(mtx, imputed_mtx):
     start_nnz = round(mtx.nnz / (mtx.shape[0] * mtx.shape[1]), 2)
-    end_nnz = round(np.count_nonzero(rank_mtx_cor_sc) / rank_mtx_cor_sc.size, 2)
+    end_nnz = round(np.count_nonzero(imputed_mtx) / imputed_mtx.size, 2)
     print(f"Original nonzero values: {start_nnz}%")
     print(f"Imputed nonzero values: {end_nnz}%")
 
-    return rank_mtx, rank_mtx_cor, rank_mtx_cor_sc
+
+def halra(mtx, n_iter=12, quantile_prob=0.001, seed=1, normalize=False):
+    if normalize:
+        mtx = log_normalize_counts(mtx)
+    else:
+        mtx = ensure_csr(mtx)
+    mtx = mtx.tocsc()
+    n_row, n_col = mtx.shape
+    print(f"Read matrix with {n_row} cells and {n_col} genes")
+
+    rank = choose_rank(mtx, n_iter, seed)
+    recon_mtx = compute_low_rank_reconstruction(mtx, rank, n_iter, seed)
+    thresh_mtx = threshold_reconstruction(recon_mtx, quantile_prob)
+
+    to_scale, sigma_1_2, to_add = compute_scaling_factors(thresh_mtx, mtx)
+    imputed_mtx = scale_thresholded_matrix(thresh_mtx, to_scale, sigma_1_2, to_add)
+    imputed_mtx = zero_negatives(imputed_mtx)
+    imputed_mtx = restore_observed_values(imputed_mtx, mtx)
+
+    report_density(mtx, imputed_mtx)
+    return imputed_mtx
