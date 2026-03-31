@@ -184,12 +184,87 @@ def restore_observed_values(imputed_mtx, mtx, pres_obs="zeroed"):
 
 def report_density(mtx, imputed_mtx):
     start_nnz = round(mtx.nnz / (mtx.shape[0] * mtx.shape[1]), 2)
-    end_nnz = round(np.count_nonzero(imputed_mtx) / imputed_mtx.size, 2)
+    if sp.issparse(imputed_mtx):
+        end_nnz = round(imputed_mtx.nnz / (imputed_mtx.shape[0] * imputed_mtx.shape[1]), 2)
+    else:
+        end_nnz = round(np.count_nonzero(imputed_mtx) / imputed_mtx.size, 2)
     print(f"Original nonzero values: {start_nnz}%")
     print(f"Imputed nonzero values: {end_nnz}%")
 
 
-def halra(mtx, n_iter=12, quantile_prob=0.001, seed=1, normalize=False, pres_obs="zeroed"):
+def halra_full(mtx, rank, n_iter, quantile_prob, seed, pres_obs):
+    recon_mtx = compute_low_rank_reconstruction(mtx, rank, n_iter, seed)
+    thresh_mtx = threshold_reconstruction(recon_mtx, quantile_prob)
+
+    to_scale, sigma_1_2, to_add = compute_scaling_factors(thresh_mtx, mtx)
+    imputed_mtx = scale_thresholded_matrix(thresh_mtx, to_scale, sigma_1_2, to_add)
+    imputed_mtx = zero_negatives(imputed_mtx)
+    imputed_mtx = restore_observed_values(imputed_mtx, mtx, pres_obs=pres_obs)
+
+    report_density(mtx, imputed_mtx)
+    return imputed_mtx
+
+
+def compute_svd_factors(mtx, rank, n_iter, seed):
+    print("Computing low-rank factors")
+    u, s, vh = randomized_svd(mtx, n_components=rank, n_iter=n_iter, random_state=seed)
+    us = u * s
+    return us, vh
+
+
+def reconstruct_col_block(us, vh, start, stop):
+    return us @ vh[:, start:stop]
+
+
+def compute_block_thresholds(us, vh, quantile_prob, block_size):
+    n_col = vh.shape[1]
+    thresholds = np.empty(n_col, dtype=float)
+
+    for start in range(0, n_col, block_size):
+        stop = min(start + block_size, n_col)
+        recon_block = reconstruct_col_block(us, vh, start, stop)
+        thresholds[start:stop] = np.abs(np.quantile(recon_block, quantile_prob, axis=0))
+
+    return thresholds
+
+
+def threshold_block(recon_block, thresholds_block):
+    mask = recon_block <= thresholds_block[np.newaxis, :]
+    return np.where(mask, 0, recon_block)
+
+
+def halra_blockwise(mtx, rank, n_iter, quantile_prob, seed, pres_obs, block_size):
+    us, vh = compute_svd_factors(mtx, rank, n_iter, seed)
+    thresholds = compute_block_thresholds(us, vh, quantile_prob, block_size)
+
+    blocks = []
+    n_col = mtx.shape[1]
+
+    for start in range(0, n_col, block_size):
+        stop = min(start + block_size, n_col)
+        print(f"Processing genes {start} to {stop}")
+
+        mtx_block = mtx[:, start:stop]
+        recon_block = reconstruct_col_block(us, vh, start, stop)
+        thresh_block = threshold_block(recon_block, thresholds[start:stop])
+
+        to_scale, sigma_1_2, to_add = compute_scaling_factors(thresh_block, mtx_block)
+        imputed_block = scale_thresholded_matrix(thresh_block, to_scale, sigma_1_2, to_add)
+        imputed_block = zero_negatives(imputed_block)
+        imputed_block = restore_observed_values(imputed_block, mtx_block, pres_obs=pres_obs)
+
+        imputed_block[np.abs(imputed_block) < 1e-12] = 0
+        imputed_block = sp.csc_matrix(imputed_block)
+        imputed_block.eliminate_zeros()
+        blocks.append(imputed_block)
+
+    imputed_mtx = sp.hstack(blocks, format="csc").tocsr()
+    report_density(mtx, imputed_mtx)
+    return imputed_mtx
+
+
+def halra(mtx, n_iter=12, quantile_prob=0.001, seed=1, normalize=False,
+          pres_obs="zeroed", block_size=None):
     if normalize:
         mtx = log_normalize_counts(mtx)
     else:
@@ -199,14 +274,7 @@ def halra(mtx, n_iter=12, quantile_prob=0.001, seed=1, normalize=False, pres_obs
     print(f"Read matrix with {n_row} cells and {n_col} genes")
 
     rank = choose_rank(mtx, n_iter, seed)
-    recon_mtx = compute_low_rank_reconstruction(mtx, rank, n_iter, seed)
-    thresh_mtx = threshold_reconstruction(recon_mtx, quantile_prob)
-
-    to_scale, sigma_1_2, to_add = compute_scaling_factors(thresh_mtx, mtx)
-    imputed_mtx = scale_thresholded_matrix(thresh_mtx, to_scale, sigma_1_2, to_add)
-    imputed_mtx = zero_negatives(imputed_mtx)
-    imputed_mtx = restore_observed_values(imputed_mtx, mtx)
-    imputed_mtx = restore_observed_values(imputed_mtx, mtx, pres_obs=pres_obs)
-
-    report_density(mtx, imputed_mtx)
-    return imputed_mtx
+    if block_size is None:
+        return halra_full(mtx, rank, n_iter, quantile_prob, seed, pres_obs)
+    else:
+        return halra_blockwise(mtx, rank, n_iter, quantile_prob, seed, pres_obs, block_size)
