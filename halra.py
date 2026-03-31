@@ -166,10 +166,19 @@ def zero_negatives(imputed_mtx):
     return imputed_mtx
 
 
-def restore_observed_values(imputed_mtx, mtx):
+def restore_observed_values(imputed_mtx, mtx, pres_obs="zeroed"):
     coo = mtx.tocoo()
-    restore = imputed_mtx[coo.row, coo.col] == 0
-    imputed_mtx[coo.row[restore], coo.col[restore]] = coo.data[restore]
+
+    if pres_obs == "zeroed":
+        restore = imputed_mtx[coo.row, coo.col] == 0
+        imputed_mtx[coo.row[restore], coo.col[restore]] = coo.data[restore]
+    elif pres_obs == "all":
+        imputed_mtx[coo.row, coo.col] = coo.data
+    elif pres_obs == "none":
+        pass
+    else:
+        raise ValueError("pres_obs must be 'zeroed', 'all', or 'none'")
+
     return imputed_mtx
 
 
@@ -180,7 +189,7 @@ def report_density(mtx, imputed_mtx):
     print(f"Imputed nonzero values: {end_nnz}%")
 
 
-def halra(mtx, n_iter=12, quantile_prob=0.001, seed=1, normalize=False):
+def halra(mtx, n_iter=12, quantile_prob=0.001, seed=1, normalize=False, pres_obs="zeroed"):
     if normalize:
         mtx = log_normalize_counts(mtx)
     else:
@@ -197,6 +206,7 @@ def halra(mtx, n_iter=12, quantile_prob=0.001, seed=1, normalize=False):
     imputed_mtx = scale_thresholded_matrix(thresh_mtx, to_scale, sigma_1_2, to_add)
     imputed_mtx = zero_negatives(imputed_mtx)
     imputed_mtx = restore_observed_values(imputed_mtx, mtx)
+    imputed_mtx = restore_observed_values(imputed_mtx, mtx, pres_obs=pres_obs)
 
     report_density(mtx, imputed_mtx)
     return imputed_mtx
