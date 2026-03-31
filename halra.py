@@ -1,6 +1,7 @@
 import numpy as np
 import scipy.sparse as sp
 from sklearn.utils.extmath import randomized_svd
+import os
 
 
 def ensure_csr(mtx):
@@ -52,9 +53,9 @@ def log_normalize_counts(mtx, scale_factor=1e4):
 
 def choose_rank(mtx, n_iter, seed, n_comps=100, thresh=6, noise_start=80):
     if n_comps >= min(mtx.shape):
-        raise ValueError("n_comps must be smaller than the smallest dimension of mtx.")
+        raise ValueError("n_comps must be smaller than the smallest dimension of mtx")
     if noise_start > n_comps - 5:
-        raise ValueError("There need to be at least 5 singular values considered noise.")
+        raise ValueError("There need to be at least 5 singular values considered noise")
 
     noise_svals = np.arange(noise_start, n_comps)
     _, s, _ = randomized_svd(mtx, n_components=n_comps, n_iter=n_iter, random_state=seed)
@@ -223,7 +224,7 @@ def report_density(mtx, imputed_mtx):
     print(f"Imputed nonzero values: {end_nnz}%")
 
 
-def halra_blockwise(mtx, rank, n_iter, quantile_prob, seed, pres_obs, block_size):
+def halra_blockwise(mtx, rank, n_iter, quantile_prob, seed, pres_obs, block_size, out_path):
     us, vh = compute_svd_factors(mtx, rank, n_iter, seed)
     thresholds = compute_block_thresholds(us, vh, quantile_prob, block_size)
 
@@ -244,11 +245,15 @@ def halra_blockwise(mtx, rank, n_iter, quantile_prob, seed, pres_obs, block_size
         imputed_block = zero_negatives_sparse(imputed_block)
         imputed_block = restore_observed_values_sparse(imputed_block, mtx_block, pres_obs=pres_obs)
         imputed_block.eliminate_zeros()
-        blocks.append(imputed_block)
 
-    imputed_mtx = sp.hstack(blocks, format="csc").tocsr()
-    report_density(mtx, imputed_mtx)
-    return imputed_mtx
+        block_fname = f"block_{start}-{stop}.npz"
+        block_fpath = os.path.join(out_path, block_fname)
+        sp.save_npz(block_fpath, imputed_block)
+        #blocks.append(imputed_block)
+
+    #imputed_mtx = sp.hstack(blocks, format="csc").tocsr()
+    #report_density(mtx, imputed_mtx)
+    #return imputed_mtx
 
 
 def halra_full(mtx, rank, n_iter, quantile_prob, seed, pres_obs):
@@ -267,7 +272,9 @@ def halra_full(mtx, rank, n_iter, quantile_prob, seed, pres_obs):
 
 
 def halra(mtx, n_iter=12, quantile_prob=0.001, seed=1, normalize=False,
-          pres_obs="zeroed", block_size=None):
+          pres_obs="zeroed", block_size=None, out_path=None):
+    if block_size is not None and out_path is None:
+        raise ValueError("Out filepath required for blockwise imputation")
     if normalize:
         mtx = log_normalize_counts(mtx)
     else:
@@ -280,4 +287,5 @@ def halra(mtx, n_iter=12, quantile_prob=0.001, seed=1, normalize=False,
     if block_size is None:
         return halra_full(mtx, rank, n_iter, quantile_prob, seed, pres_obs)
     else:
-        return halra_blockwise(mtx, rank, n_iter, quantile_prob, seed, pres_obs, block_size)
+        halra_blockwise(mtx, rank, n_iter, quantile_prob, seed, pres_obs, block_size, out_path)
+        #return halra_blockwise(mtx, rank, n_iter, quantile_prob, seed, pres_obs, block_size, out_path)
