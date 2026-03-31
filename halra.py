@@ -90,119 +90,11 @@ def sparse_col_mean_nnz(mtx):
     return out
 
 
-def std_dev_nnz(x):
-    vals = x[x != 0]
-    return np.std(vals) if vals.size > 0 else 0.0
-
-
-def mean_nnz(x):
-    vals = x[x != 0]
-    return np.mean(vals) if vals.size > 0 else 0.0
-
-
 def compute_low_rank_reconstruction(mtx, rank, n_iter, seed):
     print("Computing low-rank reconstruction")
     u, s, vh = randomized_svd(mtx, n_components=rank, n_iter=n_iter, random_state=seed)
     recon_mtx = u @ np.diag(s) @ vh
     return recon_mtx
-
-
-def threshold_reconstruction(recon_mtx, quantile_prob):
-    print("Thresholding")
-    recon_mtx_mins = np.abs(np.quantile(recon_mtx, quantile_prob, axis=0))
-    condition = recon_mtx <= recon_mtx_mins[np.newaxis, :]
-    thresh_mtx = np.where(condition, 0, recon_mtx)
-    return thresh_mtx
-
-
-def compute_scaling_factors(thresh_mtx, mtx):
-    print("Computing scaling factors")
-    sigma_1 = np.apply_along_axis(std_dev_nnz, 0, thresh_mtx)
-    sigma_2 = sparse_col_std_nnz(mtx)
-
-    nnz_1 = np.sum(thresh_mtx != 0, axis=0)
-    mu_1 = np.divide(
-        np.sum(thresh_mtx, axis=0),
-        nnz_1,
-        out=np.zeros(thresh_mtx.shape[1], dtype=float),
-        where=nnz_1 != 0
-    )
-    mu_2 = sparse_col_mean_nnz(mtx)
-
-    to_scale = (
-        (~np.isnan(sigma_1))
-        & (~np.isnan(sigma_2))
-        & ~((sigma_1 == 0) & (sigma_2 == 0))
-        & (sigma_1 != 0)
-    )
-
-    sigma_1_2 = np.divide(
-        sigma_2,
-        sigma_1,
-        out=np.zeros_like(sigma_2, dtype=float),
-        where=sigma_1 != 0
-    )
-    to_add = -mu_1 * sigma_1_2 + mu_2
-    return to_scale, sigma_1_2, to_add
-
-
-def scale_thresholded_matrix(thresh_mtx, to_scale, sigma_1_2, to_add):
-    print(f"Scaling all except for {np.sum(~to_scale)} columns")
-    recon_mtx_tmp = thresh_mtx[:, to_scale]
-    recon_mtx_tmp = recon_mtx_tmp * sigma_1_2[to_scale]
-    recon_mtx_tmp = recon_mtx_tmp + to_add[to_scale]
-
-    imputed_mtx = thresh_mtx.copy()
-    imputed_mtx[:, to_scale] = recon_mtx_tmp
-    imputed_mtx[thresh_mtx == 0] = 0
-    return imputed_mtx
-
-
-def zero_negatives(imputed_mtx):
-    neg = imputed_mtx < 0
-    imputed_mtx[neg] = 0
-    pct_neg = round(100 * np.sum(neg) / imputed_mtx.size, 2)
-    print(f"{pct_neg}% of the values became negative in the scaling process and were set to zero.")
-    return imputed_mtx
-
-
-def restore_observed_values(imputed_mtx, mtx, pres_obs="zeroed"):
-    coo = mtx.tocoo()
-
-    if pres_obs == "zeroed":
-        restore = imputed_mtx[coo.row, coo.col] == 0
-        imputed_mtx[coo.row[restore], coo.col[restore]] = coo.data[restore]
-    elif pres_obs == "all":
-        imputed_mtx[coo.row, coo.col] = coo.data
-    elif pres_obs == "none":
-        pass
-    else:
-        raise ValueError("pres_obs must be 'zeroed', 'all', or 'none'")
-
-    return imputed_mtx
-
-
-def report_density(mtx, imputed_mtx):
-    start_nnz = round(mtx.nnz / (mtx.shape[0] * mtx.shape[1]), 2)
-    if sp.issparse(imputed_mtx):
-        end_nnz = round(imputed_mtx.nnz / (imputed_mtx.shape[0] * imputed_mtx.shape[1]), 2)
-    else:
-        end_nnz = round(np.count_nonzero(imputed_mtx) / imputed_mtx.size, 2)
-    print(f"Original nonzero values: {start_nnz}%")
-    print(f"Imputed nonzero values: {end_nnz}%")
-
-
-def halra_full(mtx, rank, n_iter, quantile_prob, seed, pres_obs):
-    recon_mtx = compute_low_rank_reconstruction(mtx, rank, n_iter, seed)
-    thresh_mtx = threshold_reconstruction(recon_mtx, quantile_prob)
-
-    to_scale, sigma_1_2, to_add = compute_scaling_factors(thresh_mtx, mtx)
-    imputed_mtx = scale_thresholded_matrix(thresh_mtx, to_scale, sigma_1_2, to_add)
-    imputed_mtx = zero_negatives(imputed_mtx)
-    imputed_mtx = restore_observed_values(imputed_mtx, mtx, pres_obs=pres_obs)
-
-    report_density(mtx, imputed_mtx)
-    return imputed_mtx
 
 
 def compute_svd_factors(mtx, rank, n_iter, seed):
@@ -228,9 +120,107 @@ def compute_block_thresholds(us, vh, quantile_prob, block_size):
     return thresholds
 
 
-def threshold_block(recon_block, thresholds_block):
-    mask = recon_block <= thresholds_block[np.newaxis, :]
-    return np.where(mask, 0, recon_block)
+def threshold_block_sparse(recon_block, thresholds):
+    mask = recon_block > thresholds[np.newaxis, :]
+    thresh_block = sp.csc_matrix(recon_block * mask)
+    thresh_block.eliminate_zeros()
+    return thresh_block
+
+
+def threshold_full_sparse(recon_mtx, quantile_prob):
+    thresholds = np.abs(np.quantile(recon_mtx, quantile_prob, axis=0))
+    return threshold_block_sparse(recon_mtx, thresholds)
+
+
+def scale_thresholded_matrix_sparse(thresh_block, to_scale, sigma_1_2, to_add):
+    print(f"Scaling all except for {np.sum(~to_scale)} columns")
+    imputed_block = sp.csc_matrix(thresh_block)
+
+    for j in np.where(to_scale)[0]:
+        start, end = imputed_block.indptr[j], imputed_block.indptr[j + 1]
+        if start == end:
+            continue
+        vals = imputed_block.data[start:end]
+        vals = vals * sigma_1_2[j] + to_add[j]
+        imputed_block.data[start:end] = vals
+
+    return imputed_block
+
+
+def compute_scaling_factors_sparse(thresh_block, mtx_block):
+    print("Computing scaling factors")
+    thresh_block = thresh_block.tocsc()
+    mtx_block = mtx_block.tocsc()
+
+    n_col = thresh_block.shape[1]
+
+    sigma_1 = np.zeros(n_col, dtype=float)
+    mu_1 = np.zeros(n_col, dtype=float)
+
+    for j in range(n_col):
+        start, end = thresh_block.indptr[j], thresh_block.indptr[j + 1]
+        vals = thresh_block.data[start:end]
+        if vals.size > 0:
+            sigma_1[j] = np.std(vals)
+            mu_1[j] = np.mean(vals)
+
+    sigma_2 = sparse_col_std_nnz(mtx_block)
+    mu_2 = sparse_col_mean_nnz(mtx_block)
+
+    to_scale = (
+        (~np.isnan(sigma_1))
+        & (~np.isnan(sigma_2))
+        & ~((sigma_1 == 0) & (sigma_2 == 0))
+        & (sigma_1 != 0)
+    )
+
+    sigma_1_2 = np.divide(
+        sigma_2,
+        sigma_1,
+        out=np.zeros_like(sigma_2, dtype=float),
+        where=sigma_1 != 0
+    )
+    to_add = -mu_1 * sigma_1_2 + mu_2
+
+    return to_scale, sigma_1_2, to_add
+
+
+def zero_negatives_sparse(imputed_block):
+    neg = imputed_block.data < 0
+    pct_neg = round(100 * np.sum(neg) / (imputed_block.shape[0] * imputed_block.shape[1]), 2)
+    imputed_block.data[neg] = 0
+    imputed_block.eliminate_zeros()
+    print(f"{pct_neg}% of the values became negative in the scaling process and were set to zero.")
+    return imputed_block
+
+
+def restore_observed_values_sparse(imputed_block, mtx_block, pres_obs="zeroed"):
+    mtx_coo = mtx_block.tocoo()
+    imputed_lil = imputed_block.tolil()
+
+    if pres_obs == "zeroed":
+        for i, j, v in zip(mtx_coo.row, mtx_coo.col, mtx_coo.data):
+            if imputed_lil[i, j] == 0:
+                imputed_lil[i, j] = v
+    elif pres_obs == "all":
+        for i, j, v in zip(mtx_coo.row, mtx_coo.col, mtx_coo.data):
+            imputed_lil[i, j] = v
+    elif pres_obs == "none":
+        pass
+    else:
+        raise ValueError("pres_obs must be 'zeroed', 'all', or 'none'")
+
+    return imputed_lil.tocsc()
+
+
+def report_density(mtx, imputed_mtx):
+    start_nnz = round(mtx.nnz / (mtx.shape[0] * mtx.shape[1]), 2)
+    if sp.issparse(imputed_mtx):
+        end_nnz = round(imputed_mtx.nnz / (imputed_mtx.shape[0] * imputed_mtx.shape[1]), 2)
+    else:
+        end_nnz = round(np.count_nonzero(imputed_mtx) / imputed_mtx.size, 2)
+    print(f"Original nonzero values: {start_nnz}%")
+    print(f"Imputed nonzero values: {end_nnz}%")
 
 
 def halra_blockwise(mtx, rank, n_iter, quantile_prob, seed, pres_obs, block_size):
@@ -246,19 +236,32 @@ def halra_blockwise(mtx, rank, n_iter, quantile_prob, seed, pres_obs, block_size
 
         mtx_block = mtx[:, start:stop]
         recon_block = reconstruct_col_block(us, vh, start, stop)
-        thresh_block = threshold_block(recon_block, thresholds[start:stop])
+        thresh_block = threshold_block_sparse(recon_block, thresholds[start:stop])
+        del recon_block
 
-        to_scale, sigma_1_2, to_add = compute_scaling_factors(thresh_block, mtx_block)
-        imputed_block = scale_thresholded_matrix(thresh_block, to_scale, sigma_1_2, to_add)
-        imputed_block = zero_negatives(imputed_block)
-        imputed_block = restore_observed_values(imputed_block, mtx_block, pres_obs=pres_obs)
-
-        imputed_block[np.abs(imputed_block) < 1e-12] = 0
-        imputed_block = sp.csc_matrix(imputed_block)
+        to_scale, sigma_1_2, to_add = compute_scaling_factors_sparse(thresh_block, mtx_block)
+        imputed_block = scale_thresholded_matrix_sparse(thresh_block, to_scale, sigma_1_2, to_add)
+        imputed_block = zero_negatives_sparse(imputed_block)
+        imputed_block = restore_observed_values_sparse(imputed_block, mtx_block, pres_obs=pres_obs)
         imputed_block.eliminate_zeros()
         blocks.append(imputed_block)
 
     imputed_mtx = sp.hstack(blocks, format="csc").tocsr()
+    report_density(mtx, imputed_mtx)
+    return imputed_mtx
+
+
+def halra_full(mtx, rank, n_iter, quantile_prob, seed, pres_obs):
+    recon_mtx = compute_low_rank_reconstruction(mtx, rank, n_iter, seed)
+    thresh_mtx = threshold_full_sparse(recon_mtx, quantile_prob)
+    del recon_mtx
+
+    to_scale, sigma_1_2, to_add = compute_scaling_factors_sparse(thresh_mtx, mtx)
+    imputed_mtx = scale_thresholded_matrix_sparse(thresh_mtx, to_scale, sigma_1_2, to_add)
+    imputed_mtx = zero_negatives_sparse(imputed_mtx)
+    imputed_mtx = restore_observed_values_sparse(imputed_mtx, mtx, pres_obs=pres_obs)
+    imputed_mtx.eliminate_zeros()
+
     report_density(mtx, imputed_mtx)
     return imputed_mtx
 
