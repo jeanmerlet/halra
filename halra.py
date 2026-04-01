@@ -1,6 +1,7 @@
 import numpy as np
 import scipy.sparse as sp
 from sklearn.utils.extmath import randomized_svd
+from write_adata import *
 import os
 
 
@@ -225,35 +226,40 @@ def report_density(mtx, imputed_mtx):
 
 
 def halra_blockwise(mtx, rank, n_iter, quantile_prob, seed, pres_obs, block_size, out_path):
-    us, vh = compute_svd_factors(mtx, rank, n_iter, seed)
-    thresholds = compute_block_thresholds(us, vh, quantile_prob, block_size)
+    n_obs, n_var = mtx.shape
+    h5f = init_h5ad_csc(out_path, n_obs, n_var)
 
-    blocks = []
-    n_col = mtx.shape[1]
+    try:
+        us, vh = compute_svd_factors(mtx, rank, n_iter, seed)
+        thresholds = compute_block_thresholds(us, vh, quantile_prob, block_size)
+        total_nnz = 0
 
-    for start in range(0, n_col, block_size):
-        stop = min(start + block_size, n_col)
-        print(f"Processing genes {start} to {stop}")
+        for start in range(0, n_var, block_size):
+            stop = min(start + block_size, n_var)
+            print(f"Processing genes {start} to {stop}")
 
-        mtx_block = mtx[:, start:stop]
-        recon_block = reconstruct_col_block(us, vh, start, stop)
-        thresh_block = threshold_block_sparse(recon_block, thresholds[start:stop])
-        del recon_block
+            mtx_block = mtx[:, start:stop]
+            recon_block = reconstruct_col_block(us, vh, start, stop)
+            thresh_block = threshold_block_sparse(recon_block, thresholds[start:stop])
+            del recon_block
 
-        to_scale, sigma_1_2, to_add = compute_scaling_factors_sparse(thresh_block, mtx_block)
-        imputed_block = scale_thresholded_matrix_sparse(thresh_block, to_scale, sigma_1_2, to_add)
-        imputed_block = zero_negatives_sparse(imputed_block)
-        imputed_block = restore_observed_values_sparse(imputed_block, mtx_block, pres_obs=pres_obs)
-        imputed_block.eliminate_zeros()
+            to_scale, sigma_1_2, to_add = compute_scaling_factors_sparse(thresh_block, mtx_block)
+            imputed_block = scale_thresholded_matrix_sparse(thresh_block, to_scale, sigma_1_2, to_add)
+            imputed_block = zero_negatives_sparse(imputed_block)
+            imputed_block = restore_observed_values_sparse(imputed_block, mtx_block, pres_obs=pres_obs)
+            imputed_block.eliminate_zeros()
 
-        block_fname = f"block_{start}-{stop}.npz"
-        block_fpath = os.path.join(out_path, block_fname)
-        sp.save_npz(block_fpath, imputed_block)
-        #blocks.append(imputed_block)
+            append_csc_block_to_h5ad(h5f, imputed_block)
+            total_nnz += imputed_block.nnz
+            start_nnz = round(mtx.nnz / (mtx.shape[0] * mtx.shape[1]), 2)
+            end_nnz = round(total_nnz / (mtx.shape[0] * mtx.shape[1]), 2)
+            print(f"Original nonzero values: {start_nnz}%")
+            print(f"Imputed nonzero values: {end_nnz}%")
 
-    #imputed_mtx = sp.hstack(blocks, format="csc").tocsr()
-    #report_density(mtx, imputed_mtx)
-    #return imputed_mtx
+    finally:
+        h5f.close()
+
+    return out_path
 
 
 def halra_full(mtx, rank, n_iter, quantile_prob, seed, pres_obs):
