@@ -1,7 +1,7 @@
 import numpy as np
 import scipy.sparse as sp
 from sklearn.utils.extmath import randomized_svd
-from write_adata import *
+from read_write_adata import *
 import os
 
 
@@ -14,7 +14,27 @@ def ensure_csr(mtx):
         raise TypeError("Input must be numpy.ndarray or scipy.sparse matrix")
 
 
-def remove_zero_genes_cells(mtx):
+def remove_zero_genes_cells(mtx, cell_names, gene_names):
+    col_sums = np.asarray(mtx.sum(axis=0)).ravel()
+    keep_cols = col_sums > 0
+    n_omit = np.sum(~keep_cols)
+    if n_omit > 0:
+        print(f"Omitted {n_omit} genes with zero counts")
+    mtx = mtx[:, keep_cols]
+    gene_names = gene_names[keep_cols]
+
+    row_sums = np.asarray(mtx.sum(axis=1)).ravel()
+    keep_rows = row_sums > 0
+    n_omit = np.sum(~keep_rows)
+    if n_omit > 0:
+        print(f"Omitted {n_omit} cells with zero counts")
+    mtx = mtx[keep_rows, :]
+    cell_names = cell_names[keep_rows]
+
+    return mtx, row_sums[keep_rows], cell_names, gene_names
+
+
+def remove_zero_genes_cells_old(mtx):
     # genes (columns)
     col_sums = np.asarray(mtx.sum(axis=0)).ravel()
     keep_cols = col_sums > 0
@@ -44,12 +64,12 @@ def log1p_sparse(mtx):
     return mtx
 
 
-def log_normalize_counts(mtx, scale_factor=1e4):
+def log_normalize_counts(mtx, cell_names, gene_names, scale_factor=1e4):
     mtx = ensure_csr(mtx)
-    mtx, row_sums = remove_zero_genes_cells(mtx)
+    mtx, row_sums, cell_names, gene_names = remove_zero_genes_cells(mtx, cell_names, gene_names)
     mtx = normalize_total(mtx, row_sums, scale_factor)
     mtx = log1p_sparse(mtx)
-    return mtx
+    return mtx, cell_names, gene_names
 
 
 def choose_rank(mtx, n_iter, seed, n_comps=100, thresh=6, noise_start=80):
@@ -225,9 +245,9 @@ def report_density(mtx, imputed_mtx):
     print(f"Imputed nonzero values: {end_nnz}%")
 
 
-def halra_blockwise(mtx, rank, n_iter, quantile_prob, seed, pres_obs, block_size, out_path):
+def halra_blockwise(mtx, cell_names, gene_names, rank, n_iter, quantile_prob, seed, pres_obs, block_size, out_path):
     n_obs, n_var = mtx.shape
-    h5f = init_h5ad_csc(out_path, n_obs, n_var)
+    h5f = init_h5ad_csc(out_path, n_obs, n_var, obs_names=cell_names, var_names=gene_names)
 
     try:
         us, vh = compute_svd_factors(mtx, rank, n_iter, seed)
@@ -277,12 +297,12 @@ def halra_full(mtx, rank, n_iter, quantile_prob, seed, pres_obs):
     return imputed_mtx
 
 
-def halra(mtx, n_iter=12, quantile_prob=0.001, seed=1, normalize=False,
+def halra(mtx, cell_names, gene_names, n_iter=12, quantile_prob=0.001, seed=1, normalize=False,
           pres_obs="zeroed", block_size=None, out_path=None):
     if block_size is not None and out_path is None:
         raise ValueError("Out filepath required for blockwise imputation")
     if normalize:
-        mtx = log_normalize_counts(mtx)
+        mtx, cell_names, gene_names = log_normalize_counts(mtx, cell_names, gene_names)
     else:
         mtx = ensure_csr(mtx)
     mtx = mtx.tocsc()
@@ -293,5 +313,4 @@ def halra(mtx, n_iter=12, quantile_prob=0.001, seed=1, normalize=False,
     if block_size is None:
         return halra_full(mtx, rank, n_iter, quantile_prob, seed, pres_obs)
     else:
-        halra_blockwise(mtx, rank, n_iter, quantile_prob, seed, pres_obs, block_size, out_path)
-        #return halra_blockwise(mtx, rank, n_iter, quantile_prob, seed, pres_obs, block_size, out_path)
+        out_path = halra_blockwise(mtx, cell_names, gene_names, rank, n_iter, quantile_prob, seed, pres_obs, block_size, out_path)

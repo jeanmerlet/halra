@@ -6,11 +6,33 @@ import h5py
 import os
 
 
-def init_h5ad_csc(out_path, n_obs, n_var, obs_names=None, var_names=None):
-    if obs_names is None:
-        obs_names = [str(i) for i in range(n_obs)]
-    if var_names is None:
-        var_names = [str(i) for i in range(n_var)]
+def parse_input_matrix(mtx, cell_names=None, gene_names=None):
+    if isinstance(mtx, ad.AnnData):
+        x = mtx.X
+        cell_names = np.asarray(mtx.obs_names, dtype=object)
+        gene_names = np.asarray(mtx.var_names, dtype=object)
+    elif isinstance(mtx, np.ndarray) or sp.issparse(mtx):
+        x = mtx
+        if cell_names is None or gene_names is None:
+            raise ValueError(
+                "For numpy.ndarray or scipy.sparse input, both cell_names and gene_names must be provided."
+            )
+        cell_names = np.asarray(cell_names, dtype=object)
+        gene_names = np.asarray(gene_names, dtype=object)
+    else:
+        raise TypeError("mtx must be AnnData, numpy.ndarray, or scipy.sparse matrix")
+
+    if x.shape[0] != len(cell_names):
+        raise ValueError("Length of cell_names must match number of rows in mtx")
+    if x.shape[1] != len(gene_names):
+        raise ValueError("Length of gene_names must match number of columns in mtx")
+
+    return x, cell_names, gene_names
+
+
+def init_h5ad_csc(out_path, n_obs, n_var, obs_names, var_names):
+    obs = pd.DataFrame(index=pd.Index(np.asarray(obs_names, dtype=str), name="obs_names"))
+    var = pd.DataFrame(index=pd.Index(np.asarray(var_names, dtype=str), name="var_names"))
 
     f = h5py.File(out_path, "w")
 
