@@ -72,7 +72,7 @@ def log_normalize_counts(mtx, cell_names, gene_names, scale_factor=1e4):
     return mtx, cell_names, gene_names
 
 
-def choose_rank(mtx, n_iter, seed, n_comps=100, thresh=6, noise_start=80):
+def choose_mtx_rank(mtx, n_iter, seed, n_comps=100, thresh=6, noise_start=80):
     if n_comps >= min(mtx.shape):
         raise ValueError("n_comps must be smaller than the smallest dimension of mtx")
     if noise_start > n_comps - 5:
@@ -245,7 +245,95 @@ def report_density(mtx, imputed_mtx):
     print(f"Imputed nonzero values: {end_nnz}%")
 
 
-def halra_blockwise(mtx, cell_names, gene_names, rank, n_iter, quantile_prob, seed, pres_obs, block_size, out_path):
+def process_gene_block(mtx, us, vh, start, stop, quantile_prob, pres_obs):
+    print(f"Processing genes {start} to {stop}")
+
+    mtx_block = mtx[:, start:stop]
+    recon_block = reconstruct_col_block(us, vh, start, stop)
+    thresholds = np.abs(np.quantile(recon_block, quantile_prob, axis=0))
+    thresh_block = threshold_block_sparse(recon_block, thresholds)
+    del recon_block
+
+    to_scale, sigma_1_2, to_add = compute_scaling_factors_sparse(thresh_block, mtx_block)
+    imputed_block = scale_thresholded_matrix_sparse(thresh_block, to_scale, sigma_1_2, to_add)
+    imputed_block = zero_negatives_sparse(imputed_block)
+    imputed_block = restore_observed_values_sparse(imputed_block, mtx_block, pres_obs=pres_obs)
+    imputed_block.eliminate_zeros()
+
+    return imputed_block
+
+
+def halra_blockwise(mtx, cell_names, gene_names, rank, n_iter, quantile_prob,
+                    seed, pres_obs, block_size, out_path, comm=MPI.COMM_WORLD):
+    from mpi4py import MPI
+    comm = MPI.COMM_WORLD
+    mpi_rank = comm.Get_rank()
+    mpi_size = comm.Get_size()
+
+    n_obs, n_var = mtx.shape
+    block_starts = list(range(0, n_var, block_size))
+    n_blocks = len(block_starts)
+
+    # one MPI rank per block
+    if mpi_size != n_blocks:
+        if mpi_rank == 0:
+            raise ValueError(
+                f"Phase 1 assumes one MPI rank per block, but got "
+                f"{mpi_size} ranks for {n_blocks} blocks. "
+                f"Set block_size so n_blocks == number of MPI ranks."
+            )
+        else:
+            return None
+
+    us, vh = compute_svd_factors(mtx, rank, n_iter, seed)
+    start = block_starts[mpi_rank]
+    stop = min(start + block_size, n_var)
+
+    imputed_block = process_gene_block(
+        mtx=mtx,
+        us=us,
+        vh=vh,
+        start=start,
+        stop=stop,
+        quantile_prob=quantile_prob,
+        pres_obs=pres_obs,
+    )
+
+    if mpi_rank == 0:
+        h5f = init_h5ad_csc(
+            out_path,
+            n_obs,
+            n_var,
+            obs_names=cell_names,
+            var_names=gene_names,
+        )
+
+        try:
+            total_nnz = 0
+            # write rank 0's own block first
+            append_csc_block_to_h5ad(h5f, imputed_block)
+            total_nnz += imputed_block.nnz
+            del imputed_block
+            # then receive and write remaining blocks one at a time, in rank order
+            for i, src_rank in enumerate(range(1, mpi_size)):
+                block = comm.recv(source=src_rank, tag=src_rank)
+                append_csc_block_to_h5ad(h5f, block)
+                total_nnz += block.nnz
+                if i == mpi_size - 1:
+                    end_nnz = round(total_nnz / (mtx.shape[0] * mtx.shape[1]), 2)
+                    print(f"Original nonzero values: {start_nnz}%")
+                    print(f"Imputed nonzero values: {end_nnz}%")
+        finally:
+            h5f.close()
+
+        return out_path
+
+    else:
+        comm.send(imputed_block, dest=0, tag=mpi_rank)
+        return None
+
+
+def halra_blockwise_old(mtx, cell_names, gene_names, rank, n_iter, quantile_prob, seed, pres_obs, block_size, out_path):
     n_obs, n_var = mtx.shape
     h5f = init_h5ad_csc(out_path, n_obs, n_var, obs_names=cell_names, var_names=gene_names)
 
@@ -297,7 +385,7 @@ def halra_full(mtx, rank, n_iter, quantile_prob, seed, pres_obs):
     return imputed_mtx
 
 
-def halra(mtx, cell_names=None, gene_names=None, n_iter=12, quantile_prob=0.001, seed=1, normalize=False,
+def halra_old(mtx, cell_names=None, gene_names=None, n_iter='auto', quantile_prob=0.001, seed=1, normalize=False,
           pres_obs="zeroed", block_size=None, out_path=None):
     mtx, cell_names, gene_names = parse_input_matrix(mtx, cell_names, gene_names)
     if block_size is not None and out_path is None:
@@ -310,8 +398,33 @@ def halra(mtx, cell_names=None, gene_names=None, n_iter=12, quantile_prob=0.001,
     n_row, n_col = mtx.shape
     print(f"Read matrix with {n_row} cells and {n_col} genes")
 
-    rank = choose_rank(mtx, n_iter, seed)
+    rank = choose_mtx_rank(mtx, n_iter, seed)
     if block_size is None:
         return halra_full(mtx, rank, n_iter, quantile_prob, seed, pres_obs)
     else:
         return halra_blockwise(mtx, cell_names, gene_names, rank, n_iter, quantile_prob, seed, pres_obs, block_size, out_path)
+
+
+
+
+def halra(mtx, cell_names=None, gene_names=None, n_iter='auto', quantile_prob=0.001,
+          seed=1, normalize=False, pres_obs="zeroed", block_size=None, out_path=None):
+    mtx, cell_names, gene_names = parse_input_matrix(mtx, cell_names, gene_names)
+    if block_size is not None and out_path is None:
+        raise ValueError("out_path required for blockwise imputation")
+    if normalize:
+        mtx, cell_names, gene_names = log_normalize_counts(mtx, cell_names, gene_names)
+    else:
+        mtx = ensure_csr(mtx)
+    mtx = mtx.tocsc()
+    n_row, n_col = mtx.shape
+    print(f"Read matrix with {n_row} cells and {n_col} genes")
+
+    mtx_rank = choose_mtx_rank(mtx, n_iter, seed)
+    if block_size is None:
+        return halra_full(mtx, mtx_rank, n_iter, quantile_prob, seed, pres_obs)
+    else:
+        return halra_blockwise(
+            mtx, cell_names, gene_names, mtx_rank, n_iter,
+            quantile_prob, seed, pres_obs, block_size, out_path
+        )
