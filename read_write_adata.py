@@ -1,12 +1,13 @@
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
+import anndata as ad
 from anndata.io import write_elem
 import h5py
 import os
 
 
-def parse_input_matrix(mtx, cell_names=None, gene_names=None):
+def parse_input_matrix(mtx, cell_names, gene_names):
     if isinstance(mtx, ad.AnnData):
         x = mtx.X
         cell_names = np.asarray(mtx.obs_names, dtype=object)

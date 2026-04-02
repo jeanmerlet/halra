@@ -297,10 +297,11 @@ def halra_full(mtx, rank, n_iter, quantile_prob, seed, pres_obs):
     return imputed_mtx
 
 
-def halra(mtx, cell_names, gene_names, n_iter=12, quantile_prob=0.001, seed=1, normalize=False,
+def halra(mtx, cell_names=None, gene_names=None, n_iter=12, quantile_prob=0.001, seed=1, normalize=False,
           pres_obs="zeroed", block_size=None, out_path=None):
+    mtx, cell_names, gene_names = parse_input_matrix(mtx, cell_names, gene_names)
     if block_size is not None and out_path is None:
-        raise ValueError("Out filepath required for blockwise imputation")
+        raise ValueError("out_path required for blockwise imputation")
     if normalize:
         mtx, cell_names, gene_names = log_normalize_counts(mtx, cell_names, gene_names)
     else:
@@ -313,4 +314,4 @@ def halra(mtx, cell_names, gene_names, n_iter=12, quantile_prob=0.001, seed=1, n
     if block_size is None:
         return halra_full(mtx, rank, n_iter, quantile_prob, seed, pres_obs)
     else:
-        out_path = halra_blockwise(mtx, cell_names, gene_names, rank, n_iter, quantile_prob, seed, pres_obs, block_size, out_path)
+        return halra_blockwise(mtx, cell_names, gene_names, rank, n_iter, quantile_prob, seed, pres_obs, block_size, out_path)
