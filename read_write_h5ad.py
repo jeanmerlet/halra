@@ -70,7 +70,7 @@ def init_h5ad_csc(out_path, n_obs, n_var, obs_names, var_names):
         "indices",
         shape=(0,),
         maxshape=(None,),
-        dtype=np.int32,
+        dtype=np.int64,
         chunks=True,
     )
     # indptr length for CSC is n_var + 1
@@ -95,18 +95,26 @@ def append_csc_block_to_h5ad(h5_file, block_csc):
     indices_ds = x["indices"]
     indptr_ds = x["indptr"]
 
-    nnz_old = data_ds.shape[0]
-    nnz_add = block_csc.nnz
-    n_ptr_old = indptr_ds.shape[0]
-    n_ptr_add = block_csc.shape[1]
+    nnz_old = int(data_ds.shape[0])
+    nnz_add = int(block_csc.nnz)
+    n_ptr_old = int(indptr_ds.shape[0])
+    n_ptr_add = int(block_csc.shape[1])
+
+    # Cast explicitly to match on-disk dtypes and avoid overflow in arithmetic
+    data_to_write = block_csc.data.astype(data_ds.dtype, copy=False)
+    indices_to_write = block_csc.indices.astype(indices_ds.dtype, copy=False)
+
+    # Promote indptr to int64 before adding nnz_old
+    indptr_to_write = block_csc.indptr[1:].astype(np.int64, copy=False) + np.int64(nnz_old)
 
     # Append data
     data_ds.resize((nnz_old + nnz_add,))
-    data_ds[nnz_old:] = block_csc.data.astype(data_ds.dtype, copy=False)
+    data_ds[nnz_old:] = data_to_write
 
     # Append row indices
     indices_ds.resize((nnz_old + nnz_add,))
-    indices_ds[nnz_old:] = block_csc.indices.astype(indices_ds.dtype, copy=False)
+    indices_ds[nnz_old:] = indices_to_write
+
     # Append indptr, skipping the leading 0 and offsetting by prior nnz
     indptr_ds.resize((n_ptr_old + n_ptr_add,))
-    indptr_ds[n_ptr_old:] = block_csc.indptr[1:] + nnz_old
+    indptr_ds[n_ptr_old:] = indptr_to_write

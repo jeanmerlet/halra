@@ -1,86 +1,54 @@
 import numpy as np
 import scipy.sparse as sp
 from sklearn.utils.extmath import randomized_svd
-from read_write_adata import *
 import os
 
 
-def ensure_csr(mtx):
+def parse_input(mtx, cells, genes):
+    assert isinstance(mtx, np.ndarray) or sp.issparse(mtx)
     if isinstance(mtx, np.ndarray):
-        return sp.csr_matrix(mtx)
+        mtx = sp.csc_matrix(mtx)
     elif sp.issparse(mtx):
-        return mtx.tocsr()
-    else:
-        raise TypeError("Input must be numpy.ndarray or scipy.sparse matrix")
+        mtx = mtx.tocsc()
+    assert len(cells) == mtx.shape[0]
+    assert len(genes) == mtx.shape[1]
+    cells = np.asarray(cells, dtype=object)
+    genes = np.asarray(genes, dtype=object)
+    return mtx, cells, genes
 
 
-def remove_zero_genes_cells(mtx, cell_names, gene_names):
+def remove_zero_genes_cells(mtx, cells, genes):
     col_sums = np.asarray(mtx.sum(axis=0)).ravel()
     keep_cols = col_sums > 0
     n_omit = np.sum(~keep_cols)
-    if n_omit > 0:
-        print(f"Omitted {n_omit} genes with zero counts")
+    print(f"Omitted {n_omit} genes with zero counts")
     mtx = mtx[:, keep_cols]
-    gene_names = gene_names[keep_cols]
-
+    genes = genes[keep_cols]
+    mtx = mtx.tocsr()
     row_sums = np.asarray(mtx.sum(axis=1)).ravel()
     keep_rows = row_sums > 0
     n_omit = np.sum(~keep_rows)
-    if n_omit > 0:
-        print(f"Omitted {n_omit} cells with zero counts")
+    print(f"Omitted {n_omit} cells with zero counts")
     mtx = mtx[keep_rows, :]
-    cell_names = cell_names[keep_rows]
-
-    return mtx, row_sums[keep_rows], cell_names, gene_names
-
-
-def remove_zero_genes_cells_old(mtx):
-    # genes (columns)
-    col_sums = np.asarray(mtx.sum(axis=0)).ravel()
-    keep_cols = col_sums > 0
-    n_omit = np.sum(~keep_cols)
-    if n_omit > 0:
-        print(f"Omitted {n_omit} genes with zero counts")
-    mtx = mtx[:, keep_cols]
-
-    # cells (rows)
-    row_sums = np.asarray(mtx.sum(axis=1)).ravel()
-    keep_rows = row_sums > 0
-    n_omit = np.sum(~keep_rows)
-    if n_omit > 0:
-        print(f"Omitted {n_omit} cells with zero counts")
-    mtx = mtx[keep_rows, :]
-
-    return mtx, row_sums[keep_rows]
+    cells = cells[keep_rows]
+    mtx = mtx.tocsc()
+    return mtx, cells, genes
 
 
-def normalize_total(mtx, row_sums, scale_factor=1e4):
-    inv_row_sums = 1.0 / row_sums
-    return mtx.multiply(inv_row_sums[:, None]) * scale_factor
-
-
-def log1p_sparse(mtx):
+def log_normalize(mtx, scale_factor=1e4):
+    mtx = mtx.tocsr()
+    inv_row_sums = 1.0 / np.asarray(mtx.sum(axis=1)).ravel()
+    mtx = mtx.multiply(inv_row_sums[:, None]) * scale_factor
     mtx.data = np.log1p(mtx.data)
+    mtx = mtx.tocsc()
     return mtx
 
 
-def log_normalize_counts(mtx, cell_names, gene_names, scale_factor=1e4):
-    mtx = ensure_csr(mtx)
-    mtx, row_sums, cell_names, gene_names = remove_zero_genes_cells(mtx, cell_names, gene_names)
-    mtx = normalize_total(mtx, row_sums, scale_factor)
-    mtx = log1p_sparse(mtx)
-    return mtx, cell_names, gene_names
-
-
 def choose_mtx_rank(mtx, n_iter, seed, n_comps=100, thresh=6, noise_start=80):
-    if n_comps >= min(mtx.shape):
-        raise ValueError("n_comps must be smaller than the smallest dimension of mtx")
-    if noise_start > n_comps - 5:
-        raise ValueError("There need to be at least 5 singular values considered noise")
-
+    assert n_comps < min(mtx.shape)
+    assert noise_start <= n_comps - 5
     noise_svals = np.arange(noise_start, n_comps)
     _, s, _ = randomized_svd(mtx, n_components=n_comps, n_iter=n_iter, random_state=seed)
-
     diffs = s[:-1] - s[1:]
     mu = np.mean(diffs[noise_svals - 1])
     sigma = np.std(diffs[noise_svals - 1])
@@ -113,33 +81,14 @@ def sparse_col_mean_nnz(mtx):
 
 
 def compute_low_rank_reconstruction(mtx, rank, n_iter, seed):
-    print("Computing low-rank reconstruction")
     u, s, vh = randomized_svd(mtx, n_components=rank, n_iter=n_iter, random_state=seed)
     recon_mtx = u @ np.diag(s) @ vh
+    print("Computed low-rank reconstruction")
     return recon_mtx
-
-
-def compute_svd_factors(mtx, rank, n_iter, seed):
-    print("Computing low-rank factors")
-    u, s, vh = randomized_svd(mtx, n_components=rank, n_iter=n_iter, random_state=seed)
-    us = u * s
-    return us, vh
 
 
 def reconstruct_col_block(us, vh, start, stop):
     return us @ vh[:, start:stop]
-
-
-def compute_block_thresholds(us, vh, quantile_prob, block_size):
-    n_col = vh.shape[1]
-    thresholds = np.empty(n_col, dtype=float)
-
-    for start in range(0, n_col, block_size):
-        stop = min(start + block_size, n_col)
-        recon_block = reconstruct_col_block(us, vh, start, stop)
-        thresholds[start:stop] = np.abs(np.quantile(recon_block, quantile_prob, axis=0))
-
-    return thresholds
 
 
 def threshold_block_sparse(recon_block, thresholds):
@@ -154,23 +103,22 @@ def threshold_full_sparse(recon_mtx, quantile_prob):
     return threshold_block_sparse(recon_mtx, thresholds)
 
 
-def scale_thresholded_matrix_sparse(thresh_block, to_scale, sigma_1_2, to_add):
-    print(f"Scaling all except for {np.sum(~to_scale)} columns")
-    imputed_block = sp.csc_matrix(thresh_block)
+def scale_thresholded_matrix_sparse(thresh_mtx, to_scale, sigma_1_2, to_add):
+    imputed_mtx = sp.csc_matrix(thresh_mtx)
 
     for j in np.where(to_scale)[0]:
-        start, end = imputed_block.indptr[j], imputed_block.indptr[j + 1]
+        start, end = imputed_mtx.indptr[j], imputed_mtx.indptr[j + 1]
         if start == end:
             continue
-        vals = imputed_block.data[start:end]
+        vals = imputed_mtx.data[start:end]
         vals = vals * sigma_1_2[j] + to_add[j]
-        imputed_block.data[start:end] = vals
+        imputed_mtx.data[start:end] = vals
 
-    return imputed_block
+    print(f"Scaled all except {np.sum(~to_scale)} genes")
+    return imputed_mtx
 
 
 def compute_scaling_factors_sparse(thresh_block, mtx_block):
-    print("Computing scaling factors")
     thresh_block = thresh_block.tocsc()
     mtx_block = mtx_block.tocsc()
 
@@ -204,6 +152,7 @@ def compute_scaling_factors_sparse(thresh_block, mtx_block):
     )
     to_add = -mu_1 * sigma_1_2 + mu_2
 
+    print("Computed scaling factors")
     return to_scale, sigma_1_2, to_add
 
 
@@ -212,7 +161,7 @@ def zero_negatives_sparse(imputed_block):
     pct_neg = round(100 * np.sum(neg) / (imputed_block.shape[0] * imputed_block.shape[1]), 2)
     imputed_block.data[neg] = 0
     imputed_block.eliminate_zeros()
-    print(f"{pct_neg}% of the values became negative in the scaling process and were set to zero.")
+    print(f"{pct_neg}% of the values became negative in the scaling process and were set to zero")
     return imputed_block
 
 
@@ -236,141 +185,13 @@ def restore_observed_values_sparse(imputed_block, mtx_block, pres_obs="zeroed"):
 
 
 def report_density(mtx, imputed_mtx):
-    start_nnz = round(mtx.nnz / (mtx.shape[0] * mtx.shape[1]), 2)
-    if sp.issparse(imputed_mtx):
-        end_nnz = round(imputed_mtx.nnz / (imputed_mtx.shape[0] * imputed_mtx.shape[1]), 2)
-    else:
-        end_nnz = round(np.count_nonzero(imputed_mtx) / imputed_mtx.size, 2)
+    start_nnz = round(100 * mtx.nnz / (mtx.shape[0] * mtx.shape[1]), 2)
+    end_nnz = round(100 * imputed_mtx.nnz / (imputed_mtx.shape[0] * imputed_mtx.shape[1]), 2)
     print(f"Original nonzero values: {start_nnz}%")
     print(f"Imputed nonzero values: {end_nnz}%")
 
 
-def process_gene_block(mtx, us, vh, start, stop, quantile_prob, pres_obs):
-    print(f"Processing genes {start} to {stop}")
-
-    mtx_block = mtx[:, start:stop]
-    recon_block = reconstruct_col_block(us, vh, start, stop)
-    thresholds = np.abs(np.quantile(recon_block, quantile_prob, axis=0))
-    thresh_block = threshold_block_sparse(recon_block, thresholds)
-    del recon_block
-
-    to_scale, sigma_1_2, to_add = compute_scaling_factors_sparse(thresh_block, mtx_block)
-    imputed_block = scale_thresholded_matrix_sparse(thresh_block, to_scale, sigma_1_2, to_add)
-    imputed_block = zero_negatives_sparse(imputed_block)
-    imputed_block = restore_observed_values_sparse(imputed_block, mtx_block, pres_obs=pres_obs)
-    imputed_block.eliminate_zeros()
-
-    return imputed_block
-
-
-def halra_blockwise(mtx, cell_names, gene_names, rank, n_iter, quantile_prob,
-                    seed, pres_obs, block_size, out_path, comm=MPI.COMM_WORLD):
-    from mpi4py import MPI
-    comm = MPI.COMM_WORLD
-    mpi_rank = comm.Get_rank()
-    mpi_size = comm.Get_size()
-
-    n_obs, n_var = mtx.shape
-    block_starts = list(range(0, n_var, block_size))
-    n_blocks = len(block_starts)
-
-    # one MPI rank per block
-    if mpi_size != n_blocks:
-        if mpi_rank == 0:
-            raise ValueError(
-                f"Phase 1 assumes one MPI rank per block, but got "
-                f"{mpi_size} ranks for {n_blocks} blocks. "
-                f"Set block_size so n_blocks == number of MPI ranks."
-            )
-        else:
-            return None
-
-    us, vh = compute_svd_factors(mtx, rank, n_iter, seed)
-    start = block_starts[mpi_rank]
-    stop = min(start + block_size, n_var)
-
-    imputed_block = process_gene_block(
-        mtx=mtx,
-        us=us,
-        vh=vh,
-        start=start,
-        stop=stop,
-        quantile_prob=quantile_prob,
-        pres_obs=pres_obs,
-    )
-
-    if mpi_rank == 0:
-        h5f = init_h5ad_csc(
-            out_path,
-            n_obs,
-            n_var,
-            obs_names=cell_names,
-            var_names=gene_names,
-        )
-
-        try:
-            total_nnz = 0
-            # write rank 0's own block first
-            append_csc_block_to_h5ad(h5f, imputed_block)
-            total_nnz += imputed_block.nnz
-            del imputed_block
-            # then receive and write remaining blocks one at a time, in rank order
-            for i, src_rank in enumerate(range(1, mpi_size)):
-                block = comm.recv(source=src_rank, tag=src_rank)
-                append_csc_block_to_h5ad(h5f, block)
-                total_nnz += block.nnz
-                if i == mpi_size - 1:
-                    end_nnz = round(total_nnz / (mtx.shape[0] * mtx.shape[1]), 2)
-                    print(f"Original nonzero values: {start_nnz}%")
-                    print(f"Imputed nonzero values: {end_nnz}%")
-        finally:
-            h5f.close()
-
-        return out_path
-
-    else:
-        comm.send(imputed_block, dest=0, tag=mpi_rank)
-        return None
-
-
-def halra_blockwise_old(mtx, cell_names, gene_names, rank, n_iter, quantile_prob, seed, pres_obs, block_size, out_path):
-    n_obs, n_var = mtx.shape
-    h5f = init_h5ad_csc(out_path, n_obs, n_var, obs_names=cell_names, var_names=gene_names)
-
-    try:
-        us, vh = compute_svd_factors(mtx, rank, n_iter, seed)
-        thresholds = compute_block_thresholds(us, vh, quantile_prob, block_size)
-        total_nnz = 0
-
-        for start in range(0, n_var, block_size):
-            stop = min(start + block_size, n_var)
-            print(f"Processing genes {start} to {stop}")
-
-            mtx_block = mtx[:, start:stop]
-            recon_block = reconstruct_col_block(us, vh, start, stop)
-            thresh_block = threshold_block_sparse(recon_block, thresholds[start:stop])
-            del recon_block
-
-            to_scale, sigma_1_2, to_add = compute_scaling_factors_sparse(thresh_block, mtx_block)
-            imputed_block = scale_thresholded_matrix_sparse(thresh_block, to_scale, sigma_1_2, to_add)
-            imputed_block = zero_negatives_sparse(imputed_block)
-            imputed_block = restore_observed_values_sparse(imputed_block, mtx_block, pres_obs=pres_obs)
-            imputed_block.eliminate_zeros()
-
-            append_csc_block_to_h5ad(h5f, imputed_block)
-            total_nnz += imputed_block.nnz
-            start_nnz = round(mtx.nnz / (mtx.shape[0] * mtx.shape[1]), 2)
-            end_nnz = round(total_nnz / (mtx.shape[0] * mtx.shape[1]), 2)
-            print(f"Original nonzero values: {start_nnz}%")
-            print(f"Imputed nonzero values: {end_nnz}%")
-
-    finally:
-        h5f.close()
-
-    return out_path
-
-
-def halra_full(mtx, rank, n_iter, quantile_prob, seed, pres_obs):
+def impute(mtx, rank, n_iter, quantile_prob, pres_obs, seed):
     recon_mtx = compute_low_rank_reconstruction(mtx, rank, n_iter, seed)
     thresh_mtx = threshold_full_sparse(recon_mtx, quantile_prob)
     del recon_mtx
@@ -385,46 +206,12 @@ def halra_full(mtx, rank, n_iter, quantile_prob, seed, pres_obs):
     return imputed_mtx
 
 
-def halra_old(mtx, cell_names=None, gene_names=None, n_iter='auto', quantile_prob=0.001, seed=1, normalize=False,
-          pres_obs="zeroed", block_size=None, out_path=None):
-    mtx, cell_names, gene_names = parse_input_matrix(mtx, cell_names, gene_names)
-    if block_size is not None and out_path is None:
-        raise ValueError("out_path required for blockwise imputation")
-    if normalize:
-        mtx, cell_names, gene_names = log_normalize_counts(mtx, cell_names, gene_names)
-    else:
-        mtx = ensure_csr(mtx)
-    mtx = mtx.tocsc()
+def halra(mtx, cells, genes, normalize=False, n_iter=12,
+          quantile_prob=0.001, mtx_rank=None, pres_obs="zeroed", seed=0):
+    mtx, cells, genes = parse_input(mtx, cells, genes)
+    mtx, cells, genes = remove_zero_genes_cells(mtx, cells, genes)
+    if normalize: mtx = log_normalize(mtx)
     n_row, n_col = mtx.shape
     print(f"Read matrix with {n_row} cells and {n_col} genes")
-
-    rank = choose_mtx_rank(mtx, n_iter, seed)
-    if block_size is None:
-        return halra_full(mtx, rank, n_iter, quantile_prob, seed, pres_obs)
-    else:
-        return halra_blockwise(mtx, cell_names, gene_names, rank, n_iter, quantile_prob, seed, pres_obs, block_size, out_path)
-
-
-
-
-def halra(mtx, cell_names=None, gene_names=None, n_iter='auto', quantile_prob=0.001,
-          seed=1, normalize=False, pres_obs="zeroed", block_size=None, out_path=None):
-    mtx, cell_names, gene_names = parse_input_matrix(mtx, cell_names, gene_names)
-    if block_size is not None and out_path is None:
-        raise ValueError("out_path required for blockwise imputation")
-    if normalize:
-        mtx, cell_names, gene_names = log_normalize_counts(mtx, cell_names, gene_names)
-    else:
-        mtx = ensure_csr(mtx)
-    mtx = mtx.tocsc()
-    n_row, n_col = mtx.shape
-    print(f"Read matrix with {n_row} cells and {n_col} genes")
-
-    mtx_rank = choose_mtx_rank(mtx, n_iter, seed)
-    if block_size is None:
-        return halra_full(mtx, mtx_rank, n_iter, quantile_prob, seed, pres_obs)
-    else:
-        return halra_blockwise(
-            mtx, cell_names, gene_names, mtx_rank, n_iter,
-            quantile_prob, seed, pres_obs, block_size, out_path
-        )
+    if mtx_rank is None: mtx_rank = choose_mtx_rank(mtx, n_iter, seed)
+    return impute(mtx, mtx_rank, n_iter, quantile_prob, pres_obs, seed)
