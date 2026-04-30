@@ -188,4 +188,5 @@ def halra(matrix, cells, genes, normalize=False, n_iter=12,
     n_row, n_col = matrix.shape
     print(f"Read matrix with {n_row} cells and {n_col} genes")
     if matrix_rank is None: matrix_rank = choose_matrix_rank(matrix, n_iter, seed)
-    return impute_matrix(matrix, matrix_rank, n_iter, quantile_prob, seed)
+    imputed_matrix = impute_matrix(matrix, matrix_rank, n_iter, quantile_prob, seed)
+    return imputed_matrix, cells, genes
