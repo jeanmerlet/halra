@@ -9,21 +9,34 @@ from read_write_h5ad_parallel import (
 )
 
 
-def log_normalize_counts(X, target_sum=1e4):
+def log_normalize_counts(X, target_sum=1e4, data_dtype=np.float32):
+    """Log-normalize a CSR count matrix with minimal extra memory.
+
+    This version intentionally does not drop all-zero rows. Avoiding row
+    filtering prevents a large temporary copy at Tahoe100M scale and preserves
+    the original row count/order in the output h5ad.
+    """
     if not sparse.isspmatrix_csr(X):
         X = sparse.csr_matrix(X)
+
+    X = X.tocsr(copy=False)
+
+    if X.data.dtype != np.dtype(data_dtype):
+        X.data = X.data.astype(data_dtype, copy=False)
 
     counts = np.asarray(X.sum(axis=1)).ravel()
     keep = counts > 0
 
-    X = X[keep].copy()
-    counts = counts[keep]
+    scale = np.zeros(counts.shape, dtype=data_dtype)
+    scale[keep] = target_sum / counts[keep]
 
-    scale = target_sum / counts
-    X = sparse.diags(scale, format="csr") @ X
-    X.data = np.log1p(X.data)
+    row_nnz = np.diff(X.indptr)
 
-    return X.tocsr(), keep
+    # One scale factor per stored value. This avoids sparse.diags(scale) @ X.
+    X.data *= np.repeat(scale, row_nnz)
+    np.log1p(X.data, out=X.data)
+
+    return X, keep
 
 
 def row_bounds(n_rows, rank, size):
@@ -46,8 +59,15 @@ def normalize_h5ad_parallel(
     start, end = row_bounds(n_obs, rank, size)
 
     X = read_h5ad_row_chunk(in_path, start, end)
-    X_norm, keep = log_normalize_counts(X, target_sum=target_sum)
-    kept_input_rows = np.arange(start, end, dtype=np.int64)[keep]
+    X_norm, _ = log_normalize_counts(
+        X,
+        target_sum=target_sum,
+        data_dtype=data_dtype,
+    )
+
+    # Keep all rows to avoid expensive row filtering/copying. This preserves
+    # original obs_names and lets the writer copy metadata without dropping rows.
+    kept_input_rows = np.arange(start, end, dtype=np.int64)
 
     write_h5ad_parallel_csc_with_csr_layer(
         in_path=in_path,
