@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 import h5py
 import numpy as np
 import anndata as ad
@@ -7,6 +8,11 @@ from mpi4py import MPI
 
 
 _INT_DTYPE = np.int64
+_INDEX_DTYPE = np.int64
+
+# Keep individual HDF5 hyperslab writes comfortably below sizes that can
+# trigger HDF5/h5py "size to size_i" conversion errors on large sparse arrays.
+_DEFAULT_WRITE_BLOCK = 10_000_000
 
 
 def get_h5ad_shape(path):
@@ -80,6 +86,60 @@ def _create_sparse_group(parent, name, encoding_type, shape):
     return group
 
 
+def _write_1d_blocks(dataset, dst_start, values, dtype=None, block_size=_DEFAULT_WRITE_BLOCK):
+    """Write a 1D array to an HDF5 dataset in bounded contiguous blocks."""
+    values = np.asarray(values)
+    n = int(values.shape[0])
+
+    if n == 0:
+        return
+
+    dst_start = int(dst_start)
+
+    for src_start in range(0, n, block_size):
+        src_end = min(src_start + block_size, n)
+        block = values[src_start:src_end]
+
+        if dtype is not None:
+            block = np.asarray(block, dtype=dtype)
+
+        block = np.ascontiguousarray(block)
+
+        out_start = dst_start + src_start
+        out_end = dst_start + src_end
+        dataset[out_start:out_end] = block
+
+
+def _write_sparse_column_blocks(
+    x_data,
+    x_indices,
+    X_csc,
+    local_col_offsets,
+    row_offset,
+    data_dtype,
+):
+    """Write a local CSC chunk into global CSC datasets column by column."""
+    for col in range(X_csc.shape[1]):
+        src_start, src_end = X_csc.indptr[col], X_csc.indptr[col + 1]
+        if src_start == src_end:
+            continue
+
+        dst_start = int(local_col_offsets[col])
+
+        _write_1d_blocks(
+            x_data,
+            dst_start,
+            X_csc.data[src_start:src_end],
+            dtype=data_dtype,
+        )
+        _write_1d_blocks(
+            x_indices,
+            dst_start,
+            X_csc.indices[src_start:src_end] + row_offset,
+            dtype=_INDEX_DTYPE,
+        )
+
+
 def write_h5ad_parallel_csc_with_csr_layer(
     in_path,
     out_path,
@@ -89,6 +149,7 @@ def write_h5ad_parallel_csc_with_csr_layer(
     comm,
     data_dtype=np.float32,
     csr_layer_name="csr",
+    write_block_size=_DEFAULT_WRITE_BLOCK,
 ):
     """Write normalized data to one h5ad using parallel HDF5.
 
@@ -98,6 +159,9 @@ def write_h5ad_parallel_csc_with_csr_layer(
     This fast MPI-HDF5 path intentionally does not use HDF5 compression,
     because filter compression is not compatible with these independent
     parallel sparse writes.
+
+    Large 1D sparse arrays are written in bounded blocks to avoid HDF5/h5py
+    failures on very large hyperslab writes.
     """
     if not h5py.get_config().mpi:
         raise RuntimeError("This function requires h5py compiled with MPI support.")
@@ -109,23 +173,23 @@ def write_h5ad_parallel_csc_with_csr_layer(
 
     local_n_obs = np.int64(X_csr.shape[0])
     local_nnz = np.int64(X_csr.nnz)
-    local_col_counts = np.diff(X_csc.indptr).astype(np.int64, copy=False)
+    local_col_counts = np.diff(X_csc.indptr).astype(_INT_DTYPE, copy=False)
 
-    all_n_obs = np.asarray(comm.allgather(local_n_obs), dtype=np.int64)
-    all_nnz = np.asarray(comm.allgather(local_nnz), dtype=np.int64)
-    all_col_counts = np.vstack(comm.allgather(local_col_counts))
+    all_n_obs = np.asarray(comm.allgather(local_n_obs), dtype=_INT_DTYPE)
+    all_nnz = np.asarray(comm.allgather(local_nnz), dtype=_INT_DTYPE)
+    all_col_counts = np.vstack(comm.allgather(local_col_counts)).astype(_INT_DTYPE, copy=False)
 
     n_obs_out = int(all_n_obs.sum())
     row_offset = int(all_n_obs[:rank].sum())
     nnz_offset = int(all_nnz[:rank].sum())
     nnz = int(all_nnz.sum())
 
-    col_counts = all_col_counts.sum(axis=0, dtype=np.int64)
-    csc_indptr = np.empty(n_vars + 1, dtype=np.int64)
+    col_counts = all_col_counts.sum(axis=0, dtype=_INT_DTYPE)
+    csc_indptr = np.empty(n_vars + 1, dtype=_INT_DTYPE)
     csc_indptr[0] = 0
-    csc_indptr[1:] = np.cumsum(col_counts)
+    csc_indptr[1:] = np.cumsum(col_counts, dtype=_INT_DTYPE)
 
-    local_col_offsets = csc_indptr[:-1] + all_col_counts[:rank].sum(axis=0, dtype=np.int64)
+    local_col_offsets = csc_indptr[:-1] + all_col_counts[:rank].sum(axis=0, dtype=_INT_DTYPE)
 
     with h5py.File(out_path, "w", driver="mpio", comm=comm) as f:
         f.attrs["encoding-type"] = "anndata"
@@ -133,8 +197,8 @@ def write_h5ad_parallel_csc_with_csr_layer(
 
         x_group = _create_sparse_group(f, "X", "csc_matrix", (n_obs_out, n_vars))
         x_data = x_group.create_dataset("data", shape=(nnz,), dtype=data_dtype)
-        x_indices = x_group.create_dataset("indices", shape=(nnz,), dtype=np.int64)
-        x_group.create_dataset("indptr", data=csc_indptr, dtype=np.int64)
+        x_indices = x_group.create_dataset("indices", shape=(nnz,), dtype=_INDEX_DTYPE)
+        x_group.create_dataset("indptr", data=csc_indptr, dtype=_INT_DTYPE)
 
         layers_group = f.create_group("layers")
         layers_group.attrs["encoding-type"] = "dict"
@@ -147,44 +211,55 @@ def write_h5ad_parallel_csc_with_csr_layer(
             (n_obs_out, n_vars),
         )
         csr_data = csr_group.create_dataset("data", shape=(nnz,), dtype=data_dtype)
-        csr_indices = csr_group.create_dataset("indices", shape=(nnz,), dtype=np.int64)
-        csr_indptr = csr_group.create_dataset("indptr", shape=(n_obs_out + 1,), dtype=np.int64)
+        csr_indices = csr_group.create_dataset("indices", shape=(nnz,), dtype=_INDEX_DTYPE)
+        csr_indptr = csr_group.create_dataset("indptr", shape=(n_obs_out + 1,), dtype=_INT_DTYPE)
 
-        for col in range(n_vars):
-            src_start, src_end = X_csc.indptr[col], X_csc.indptr[col + 1]
-            if src_start == src_end:
-                continue
-
-            dst_start = int(local_col_offsets[col])
-            dst_end = dst_start + (src_end - src_start)
-
-            x_data[dst_start:dst_end] = X_csc.data[src_start:src_end].astype(
-                data_dtype,
-                copy=False,
-            )
-            x_indices[dst_start:dst_end] = X_csc.indices[src_start:src_end] + row_offset
+        _write_sparse_column_blocks(
+            x_data=x_data,
+            x_indices=x_indices,
+            X_csc=X_csc,
+            local_col_offsets=local_col_offsets,
+            row_offset=row_offset,
+            data_dtype=data_dtype,
+        )
 
         local_start = nnz_offset
-        local_end = nnz_offset + int(local_nnz)
 
-        csr_data[local_start:local_end] = X_csr.data.astype(data_dtype, copy=False)
-        csr_indices[local_start:local_end] = X_csr.indices.astype(np.int64, copy=False)
+        _write_1d_blocks(
+            csr_data,
+            local_start,
+            X_csr.data,
+            dtype=data_dtype,
+            block_size=write_block_size,
+        )
+        _write_1d_blocks(
+            csr_indices,
+            local_start,
+            X_csr.indices,
+            dtype=_INDEX_DTYPE,
+            block_size=write_block_size,
+        )
 
         if rank == 0:
-            csr_indptr[0] = 0
+            csr_indptr[0] = np.array(0, dtype=_INT_DTYPE)
 
         if local_n_obs > 0:
             ptr_start = row_offset + 1
-            ptr_end = row_offset + int(local_n_obs) + 1
-            csr_indptr[ptr_start:ptr_end] = X_csr.indptr[1:] + nnz_offset
+            _write_1d_blocks(
+                csr_indptr,
+                ptr_start,
+                X_csr.indptr[1:] + nnz_offset,
+                dtype=_INT_DTYPE,
+                block_size=write_block_size,
+            )
 
-    kept_rows_by_rank = comm.gather(np.asarray(kept_input_rows, dtype=np.int64), root=0)
+    kept_rows_by_rank = comm.gather(np.asarray(kept_input_rows, dtype=_INT_DTYPE), root=0)
 
     if rank == 0:
         kept_rows = (
             np.concatenate(kept_rows_by_rank)
             if kept_rows_by_rank
-            else np.array([], dtype=np.int64)
+            else np.array([], dtype=_INT_DTYPE)
         )
         _write_minimal_h5ad_metadata(in_path, out_path, kept_rows)
 
@@ -225,7 +300,7 @@ def read_csr_layer_row_block(
         data_end = int(indptr[-1])
 
         data = group["data"][data_start:data_end]
-        indices = group["indices"][data_start:data_end].astype(_INT_DTYPE, copy=False)
+        indices = group["indices"][data_start:data_end].astype(_INDEX_DTYPE, copy=False)
         local_indptr = indptr - data_start
 
     return sparse.csr_matrix((data, indices, local_indptr), shape=(end - start, n_vars))
@@ -242,4 +317,3 @@ def read_local_csr_layer_block(
     n_obs, _ = get_csr_layer_shape(path, csr_layer_name=csr_layer_name)
     start, end = row_bounds(n_obs, rank, size)
     return read_csr_layer_row_block(path, start, end, csr_layer_name), start, end
-
