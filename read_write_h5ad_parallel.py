@@ -117,8 +117,11 @@ def _write_sparse_column_blocks(
     local_col_offsets,
     row_offset,
     data_dtype,
+    write_block_size,
 ):
     """Write a local CSC chunk into global CSC datasets column by column."""
+    row_offset = np.int64(row_offset)
+
     for col in range(X_csc.shape[1]):
         src_start, src_end = X_csc.indptr[col], X_csc.indptr[col + 1]
         if src_start == src_end:
@@ -131,12 +134,21 @@ def _write_sparse_column_blocks(
             dst_start,
             X_csc.data[src_start:src_end],
             dtype=data_dtype,
+            block_size=write_block_size,
+        )
+
+        # Cast before adding row_offset, otherwise SciPy's int32 indices can
+        # overflow before the final HDF5 write.
+        global_rows = (
+            X_csc.indices[src_start:src_end].astype(_INDEX_DTYPE, copy=False)
+            + row_offset
         )
         _write_1d_blocks(
             x_indices,
             dst_start,
-            X_csc.indices[src_start:src_end] + row_offset,
+            global_rows,
             dtype=_INDEX_DTYPE,
+            block_size=write_block_size,
         )
 
 
@@ -180,8 +192,8 @@ def write_h5ad_parallel_csc_with_csr_layer(
     all_col_counts = np.vstack(comm.allgather(local_col_counts)).astype(_INT_DTYPE, copy=False)
 
     n_obs_out = int(all_n_obs.sum())
-    row_offset = int(all_n_obs[:rank].sum())
-    nnz_offset = int(all_nnz[:rank].sum())
+    row_offset = np.int64(all_n_obs[:rank].sum())
+    nnz_offset = np.int64(all_nnz[:rank].sum())
     nnz = int(all_nnz.sum())
 
     col_counts = all_col_counts.sum(axis=0, dtype=_INT_DTYPE)
@@ -221,9 +233,10 @@ def write_h5ad_parallel_csc_with_csr_layer(
             local_col_offsets=local_col_offsets,
             row_offset=row_offset,
             data_dtype=data_dtype,
+            write_block_size=write_block_size,
         )
 
-        local_start = nnz_offset
+        local_start = int(nnz_offset)
 
         _write_1d_blocks(
             csr_data,
@@ -232,10 +245,11 @@ def write_h5ad_parallel_csc_with_csr_layer(
             dtype=data_dtype,
             block_size=write_block_size,
         )
+
         _write_1d_blocks(
             csr_indices,
             local_start,
-            X_csr.indices,
+            X_csr.indices.astype(_INDEX_DTYPE, copy=False),
             dtype=_INDEX_DTYPE,
             block_size=write_block_size,
         )
@@ -244,11 +258,21 @@ def write_h5ad_parallel_csc_with_csr_layer(
             csr_indptr[0] = np.array(0, dtype=_INT_DTYPE)
 
         if local_n_obs > 0:
-            ptr_start = row_offset + 1
+            ptr_start = int(row_offset) + 1
+
+            # Critical Tahoe-scale fix:
+            # X_csr.indptr is commonly int32. Cast to int64 BEFORE adding the
+            # global nnz_offset; otherwise NumPy tries to perform int32 addition
+            # and raises OverflowError when nnz_offset > 2^31 - 1.
+            global_indptr = (
+                X_csr.indptr[1:].astype(_INT_DTYPE, copy=False)
+                + nnz_offset
+            )
+
             _write_1d_blocks(
                 csr_indptr,
                 ptr_start,
-                X_csr.indptr[1:] + nnz_offset,
+                global_indptr,
                 dtype=_INT_DTYPE,
                 block_size=write_block_size,
             )
