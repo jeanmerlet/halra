@@ -371,3 +371,94 @@ def read_local_csr_layer_block(path: str, comm: MPI.Comm = MPI.COMM_WORLD, csr_l
     n_obs, _ = get_csr_layer_shape(path, csr_layer_name=csr_layer_name)
     start, end = row_bounds(n_obs, rank, size)
     return read_csr_layer_row_block(path, start, end, csr_layer_name), start, end
+
+def write_h5ad_parallel_csc_from_column_blocks(
+    in_path,
+    out_path,
+    X_block,
+    col_range,
+    n_obs,
+    n_vars,
+    comm,
+    data_dtype=np.float32,
+    write_block_size=_DEFAULT_WRITE_BLOCK,
+):
+    """Write one CSC column block per MPI rank into an AnnData-compatible h5ad.
+
+    Each rank owns a contiguous column range of the final matrix and provides a
+    CSC matrix with shape ``(n_obs, col_end - col_start)``. The output h5ad
+    stores the imputed matrix in ``X`` as CSC.
+    """
+    if not h5py.get_config().mpi:
+        raise RuntimeError("This function requires h5py compiled with MPI support.")
+
+    rank = comm.Get_rank()
+    col_start, col_end = (int(col_range[0]), int(col_range[1]))
+
+    X_block = X_block.tocsc()
+    expected_shape = (int(n_obs), col_end - col_start)
+    if X_block.shape != expected_shape:
+        raise ValueError(f"X_block has shape {X_block.shape}, expected {expected_shape}")
+
+    local_counts_full = np.zeros(n_vars, dtype=_INT_DTYPE)
+    local_counts_full[col_start:col_end] = np.diff(X_block.indptr).astype(
+        _INT_DTYPE,
+        copy=False,
+    )
+
+    all_counts = np.vstack(comm.allgather(local_counts_full)).astype(
+        _INT_DTYPE,
+        copy=False,
+    )
+    col_counts = all_counts.sum(axis=0, dtype=_INT_DTYPE)
+
+    csc_indptr = np.empty(n_vars + 1, dtype=_INT_DTYPE)
+    csc_indptr[0] = 0
+    csc_indptr[1:] = np.cumsum(col_counts, dtype=_INT_DTYPE)
+
+    nnz = int(csc_indptr[-1])
+    local_start = int(csc_indptr[col_start])
+    local_end = int(csc_indptr[col_end])
+
+    if local_end - local_start != X_block.nnz:
+        raise ValueError(
+            f"Rank {rank}: global offsets imply {local_end - local_start} nnz, "
+            f"but X_block.nnz={X_block.nnz}"
+        )
+
+    with h5py.File(out_path, "w", driver="mpio", comm=comm) as f:
+        f.attrs["encoding-type"] = "anndata"
+        f.attrs["encoding-version"] = "0.1.0"
+
+        x_group = _create_sparse_group(f, "X", "csc_matrix", (n_obs, n_vars))
+        x_data = x_group.create_dataset("data", shape=(nnz,), dtype=data_dtype)
+        x_indices = x_group.create_dataset("indices", shape=(nnz,), dtype=_INDEX_DTYPE)
+        x_group.create_dataset("indptr", data=csc_indptr, dtype=_INT_DTYPE)
+
+        _write_1d_blocks(
+            x_data,
+            local_start,
+            X_block.data,
+            dtype=data_dtype,
+            block_size=write_block_size,
+        )
+        _write_1d_blocks(
+            x_indices,
+            local_start,
+            X_block.indices.astype(_INDEX_DTYPE, copy=False),
+            dtype=_INDEX_DTYPE,
+            block_size=write_block_size,
+        )
+
+        layers_group = f.create_group("layers")
+        layers_group.attrs["encoding-type"] = "dict"
+        layers_group.attrs["encoding-version"] = "0.1.0"
+
+    comm.Barrier()
+
+    if rank == 0:
+        kept_input_rows = np.arange(n_obs, dtype=_INT_DTYPE)
+        _write_minimal_h5ad_metadata(in_path, out_path, kept_input_rows)
+
+    comm.Barrier()
+

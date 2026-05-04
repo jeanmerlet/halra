@@ -18,7 +18,10 @@ import numpy as np
 from mpi4py import MPI
 from scipy import sparse
 
-from read_write_h5ad_parallel import get_h5ad_shape
+from read_write_h5ad_parallel import (
+    get_h5ad_shape,
+    write_h5ad_parallel_csc_from_column_blocks,
+)
 from svd_h5ad_parallel import compute_distributed_svd
 
 
@@ -268,3 +271,55 @@ def impute_h5ad_column_block(
         _report_distributed_density(input_block, imputed_block, n_neg, comm)
 
     return imputed_block, (col_start, col_end), s, vh_block, u_row_range
+
+def impute_h5ad_parallel(
+    in_path: str,
+    out_path: str,
+    matrix_rank: int,
+    quantile_prob: float = 0.001,
+    svd_oversample: int = 20,
+    svd_n_iter: int = 2,
+    seed: int = 0,
+    csr_layer_name: str = "csr",
+    comm: MPI.Comm = MPI.COMM_WORLD,
+    work_dtype=np.float64,
+    recon_dtype=np.float32,
+    output_dtype=np.float32,
+    report: bool = True,
+) -> None:
+    """Run distributed HALRA imputation and write the imputed matrix to h5ad.
+
+    Assumes ``in_path`` was produced by ``normalize_h5ad_parallel.py``:
+    ``adata.X`` is CSC and ``adata.layers[csr_layer_name]`` is CSR.
+
+    The output file stores the imputed matrix in ``X`` as CSC. For now, the
+    row-distributed ``U`` matrix from the SVD is gathered onto every rank before
+    column-block reconstruction, matching the tested implementation.
+    """
+    imputed_block, col_range, _, _, _ = impute_h5ad_column_block(
+        in_path=in_path,
+        matrix_rank=matrix_rank,
+        quantile_prob=quantile_prob,
+        svd_oversample=svd_oversample,
+        svd_n_iter=svd_n_iter,
+        seed=seed,
+        csr_layer_name=csr_layer_name,
+        comm=comm,
+        work_dtype=work_dtype,
+        recon_dtype=recon_dtype,
+        report=report,
+    )
+
+    n_obs, n_vars = get_h5ad_shape(in_path)
+
+    write_h5ad_parallel_csc_from_column_blocks(
+        in_path=in_path,
+        out_path=out_path,
+        X_block=imputed_block,
+        col_range=col_range,
+        n_obs=n_obs,
+        n_vars=n_vars,
+        comm=comm,
+        data_dtype=output_dtype,
+    )
+
