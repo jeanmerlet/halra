@@ -1,9 +1,6 @@
 import numpy as np
 import scipy.sparse as sp
-try:
-    import anndata as ad
-except ImportError:
-    ad = None
+import anndata as ad
 from sklearn.utils.extmath import randomized_svd
 
 
