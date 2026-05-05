@@ -1,6 +1,17 @@
 import numpy as np
 import scipy.sparse as sp
+try:
+    import anndata as ad
+except ImportError:
+    ad = None
 from sklearn.utils.extmath import randomized_svd
+
+
+def is_anndata(obj):
+    """
+    Return whether an object is an AnnData object.
+    """
+    return ad is not None and isinstance(obj, ad.AnnData)
 
 
 def validate_matrix(matrix, cells, genes):
@@ -13,6 +24,12 @@ def validate_matrix(matrix, cells, genes):
     """
     if not (isinstance(matrix, np.ndarray) or sp.issparse(matrix)):
         raise TypeError("matrix must be a NumPy ndarray or a SciPy sparse matrix")
+
+    if cells is None:
+        raise ValueError("cells must be provided when matrix is not an AnnData object")
+
+    if genes is None:
+        raise ValueError("genes must be provided when matrix is not an AnnData object")
 
     if isinstance(matrix, np.ndarray):
         matrix = sp.csc_matrix(matrix)
@@ -36,13 +53,31 @@ def validate_matrix(matrix, cells, genes):
     return matrix, cells, genes
 
 
-def filter_matrix(matrix, cells, genes, verbose=True):
+def validate_anndata(adata):
+    """
+    Validate and standardize the matrix and labels from an AnnData object.
+
+    The input AnnData object is not modified. The returned matrix is a sparse
+    CSC copy or view of adata.X, while cell and gene labels are taken from
+    obs_names and var_names.
+    """
+    if ad is None:
+        raise ImportError("anndata is required to use AnnData inputs")
+
+    if not is_anndata(adata):
+        raise TypeError("adata must be an AnnData object")
+
+    return validate_matrix(adata.X, adata.obs_names, adata.var_names)
+
+
+def filter_matrix(matrix, cells, genes, verbose=True, return_masks=False):
     """
     Remove all-zero genes and cells from a sparse expression matrix.
 
     Genes with zero total counts are removed first, followed by cells with zero
     total counts after gene filtering. The returned matrix is in CSC format, and
-    the returned cell and gene labels are filtered to match.
+    the returned cell and gene labels are filtered to match. If return_masks is
+    True, the gene and cell masks are also returned.
     """
     col_sums = np.asarray(matrix.sum(axis=0)).ravel()
     keep_cols = col_sums > 0
@@ -62,6 +97,9 @@ def filter_matrix(matrix, cells, genes, verbose=True):
     cells = cells[keep_rows]
 
     matrix = matrix.tocsc()
+
+    if return_masks:
+        return matrix, cells, genes, keep_rows, keep_cols
     return matrix, cells, genes
 
 
@@ -288,24 +326,61 @@ def impute_matrix(matrix, rank, n_iter, quantile_prob, seed, verbose=True):
     return imputed_matrix
 
 
-def halra(matrix, cells, genes, normalize=False, n_iter=12,
+def halra(matrix, cells=None, genes=None, normalize=False, n_iter=12,
           quantile_prob=0.001, matrix_rank=None, seed=0, verbose=True):
     """
-    Run HALRA imputation on a dense or sparse expression matrix.
+    Run HALRA imputation on a dense matrix, sparse matrix, or AnnData object.
 
-    The input matrix is validated, converted to CSC format, filtered to remove
-    all-zero genes and cells, optionally log-normalized, and then imputed. The
-    returned tuple contains the imputed matrix and the filtered cell and gene
-    labels.
+    If matrix is a dense or sparse matrix, cells and genes must also be provided,
+    and the returned value is a tuple containing the imputed matrix, filtered cell
+    labels, and filtered gene labels.
+
+    If matrix is an AnnData object, cells and genes are read from obs_names and
+    var_names. The returned value is a copy of the filtered AnnData object with
+    X replaced by the imputed matrix. Other AnnData annotations and metadata are
+    preserved for the retained cells and genes.
     """
-    matrix, cells, genes = validate_matrix(matrix, cells, genes)
-    matrix, cells, genes = filter_matrix(matrix, cells, genes, verbose=verbose)
+    input_is_anndata = is_anndata(matrix)
+    adata = matrix if input_is_anndata else None
+
+    if input_is_anndata:
+        matrix, cells, genes = validate_anndata(adata)
+        if verbose:
+            n_row, n_col = matrix.shape
+            print(f"Read matrix with {n_row} cells and {n_col} genes")
+        matrix, cells, genes, keep_rows, keep_cols = filter_matrix(
+            matrix,
+            cells,
+            genes,
+            verbose=verbose,
+            return_masks=True,
+        )
+    else:
+        matrix, cells, genes = validate_matrix(matrix, cells, genes)
+        if verbose:
+            n_row, n_col = matrix.shape
+            print(f"Read matrix with {n_row} cells and {n_col} genes")
+        matrix, cells, genes = filter_matrix(matrix, cells, genes, verbose=verbose)
+
     if normalize:
         matrix = log_normalize(matrix)
+
     n_row, n_col = matrix.shape
     if verbose:
-        print(f"Read matrix with {n_row} cells and {n_col} genes")
+        print(f"Imputing matrix with {n_row} cells and {n_col} genes...")
+
     if matrix_rank is None:
         matrix_rank = choose_matrix_rank(matrix, n_iter, seed, verbose=verbose)
+
     imputed_matrix = impute_matrix(matrix, matrix_rank, n_iter, quantile_prob, seed, verbose=verbose)
+
+    if verbose:
+        n_row, n_col = matrix.shape
+        print(f"Read matrix with {n_row} cells and {n_col} genes")
+
+    if input_is_anndata:
+        imputed_adata = adata[keep_rows, keep_cols].copy()
+        imputed_adata.X = imputed_matrix
+        return imputed_adata
+
     return imputed_matrix, cells, genes

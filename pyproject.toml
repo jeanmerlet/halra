@@ -13,6 +13,7 @@ authors = [
   {name = "Jean Merlet"}
 ]
 dependencies = [
+  "anndata>=0.10",
   "numpy>=1.24",
   "scipy>=1.10",
   "scikit-learn>=1.3",
