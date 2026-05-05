@@ -78,17 +78,22 @@ HALRA depends on:
 -   anndata (\>=0.10)
 
 
-## References
-
-[1] Linderman, G. C. et al. Zero-preserving imputation of single-cell RNA-seq data. Nat Commun 13, (2022).
-
-
 ## Current Limitations
 
 -   Reconstruction step is dense (SVD-based), which may limit
     scalability for extremely large datasets (>1M cells)
 -   No GPU support
 -   Distributed/HPC version is not yet integrated into the pip package
+
+
+## References
+
+[1] Linderman, G. C. et al. Zero-preserving imputation of single-cell RNA-seq data. Nat Commun 13, (2022).
+
+
+## License
+
+This project is licensed under the MIT License - see the LICENSE file for details.
 
 
 ## Notes
