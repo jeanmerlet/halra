@@ -2,7 +2,7 @@
 
 HALRA (High-performance ALRA) is a Python implementation of the ALRA
 algorithm for imputing missing values in single-cell RNA-seq data 
-[1](https://github.com/jeanmerlet/halra#references). It is designed 
+[[1](https://github.com/jeanmerlet/halra#references)]. It is designed 
 to operate efficiently on sparse matrices and scale to large
 datasets by preserving sparsity throughout the pipeline wherever
 possible.
