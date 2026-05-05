@@ -78,12 +78,13 @@ HALRA depends on:
 -   anndata (\>=0.10)
 
 
-## Current Limitations
+## Current Limitations and Experimental Features
 
 -   Reconstruction step is dense (SVD-based), which may limit
     scalability for extremely large datasets (>1M cells)
--   No GPU support
--   Distributed/HPC version is not yet integrated into the pip package
+-   Distributed and HPC-oriented implementations of HALRA are under active development
+and can be found in the `experimental/` directory. These are not yet part of the
+stable package API.
 
 
 ## References
@@ -94,9 +95,3 @@ HALRA depends on:
 ## License
 
 This project is licensed under the MIT License - see the LICENSE file for details.
-
-
-## Notes
-
-HALRA is under active development and is intended for research use. APIs
-may change as distributed and large-scale support evolves.
