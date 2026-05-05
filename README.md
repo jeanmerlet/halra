@@ -32,6 +32,9 @@ HALRA supports two input types:
 -   `cells`: list/array of cell names (length = n_rows)
 -   `genes`: list/array of gene names (length = n_cols)
 
+HALRA requires log-normalized count data, so either log normalize your 
+data first or pass normalize=True to the halra function when imputing.
+
 
 ## Installation
 
@@ -59,7 +62,7 @@ from halra import halra
 # Load your AnnData object
 adata = ad.read_h5ad("anndata.h5ad")
 
-# Run HALRA
+# Run HALRA (this assumes .X is not already normalized)
 adata_imputed = halra(adata, normalize=True)
 
 # Result:
