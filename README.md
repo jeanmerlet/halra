@@ -68,7 +68,7 @@ adata_imputed = halra(adata, normalize=True)
 ```
 
 
-## Usage Example (10x Matrix Market)
+## Usage Example (10x)
 
 ```python
 import os
