@@ -88,6 +88,7 @@ imputed_matrix, cells, genes = halra(matrix, barcodes, features, normalize=True)
 # Result:
 # imputed_matrix contains imputed values
 # cells and genes contain the filtered cell/gene labels
+```
 
 
 ## Dependency Notes
