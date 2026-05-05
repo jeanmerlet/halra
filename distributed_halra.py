@@ -28,6 +28,11 @@ from svd_h5ad_parallel import compute_distributed_svd
 _INT_DTYPE = np.int64
 
 
+def _log(message: str, comm: MPI.Comm, verbose: bool = True) -> None:
+    if verbose and comm.Get_rank() == 0:
+        print(message, flush=True)
+
+
 def column_bounds(n_cols: int, rank: int, size: int) -> tuple[int, int]:
     bounds = np.linspace(0, n_cols, size + 1, dtype=np.int64)
     return int(bounds[rank]), int(bounds[rank + 1])
@@ -59,13 +64,27 @@ def _read_csc_column_block(path: str, start: int, end: int) -> sparse.csc_matrix
 
 
 def _gather_distributed_u(U_local: np.ndarray, comm: MPI.Comm) -> np.ndarray:
-    """Gather row-distributed U onto every rank.
+    U_local = np.ascontiguousarray(U_local)
 
-    This is intentionally simple for the first downstream HALRA implementation.
-    It is not the final Tahoe100M-scalable strategy because it replicates U.
-    """
-    blocks = comm.allgather(np.asarray(U_local))
-    return np.vstack(blocks)
+    local_rows = np.array(U_local.shape[0], dtype=np.int64)
+    all_rows = np.asarray(comm.allgather(local_rows), dtype=np.int64)
+
+    n_cols = U_local.shape[1]
+    counts = all_rows * n_cols
+    displs = np.empty_like(counts)
+    displs[0] = 0
+    displs[1:] = np.cumsum(counts[:-1])
+
+    U = np.empty((int(all_rows.sum()), n_cols), dtype=U_local.dtype)
+
+    mpi_dtype = MPI._typedict[U_local.dtype.char]
+
+    comm.Allgatherv(
+        [U_local.ravel(), mpi_dtype],
+        [U.ravel(), counts.astype(np.int32), displs.astype(np.int32), mpi_dtype],
+    )
+
+    return U
 
 
 def reconstruct_column_block(
@@ -177,6 +196,7 @@ def _report_distributed_density(
     imputed_block: sparse.csc_matrix,
     n_neg_local: int,
     comm: MPI.Comm,
+    verbose: bool = True,
 ) -> None:
     rank = comm.Get_rank()
     local = np.array([input_block.nnz, imputed_block.nnz, n_neg_local], dtype=np.int64)
@@ -188,7 +208,7 @@ def _report_distributed_density(
     n_cols_total = np.array(0, dtype=np.int64)
     comm.Allreduce(n_cols_local, n_cols_total, op=MPI.SUM)
 
-    if rank == 0:
+    if verbose and rank == 0:
         denom = float(n_obs * int(n_cols_total))
         start_density = 100.0 * int(total[0]) / denom if denom else 0.0
         end_density = 100.0 * int(total[1]) / denom if denom else 0.0
@@ -210,6 +230,7 @@ def impute_h5ad_column_block(
     work_dtype=np.float64,
     recon_dtype=np.float32,
     report: bool = True,
+    verbose: bool = True,
 ) -> tuple[sparse.csc_matrix, tuple[int, int], np.ndarray, np.ndarray, tuple[int, int]]:
     """Run distributed HALRA imputation through the local column-block result.
 
@@ -237,6 +258,7 @@ def impute_h5ad_column_block(
     mpi_rank = comm.Get_rank()
     mpi_size = comm.Get_size()
 
+    _log("Computing distributed SVD factors", comm, verbose)
     U_local, s, vh, u_row_range = compute_distributed_svd(
         in_path=in_path,
         rank=matrix_rank,
@@ -248,27 +270,46 @@ def impute_h5ad_column_block(
         work_dtype=work_dtype,
     )
 
+    _log("Computed distributed SVD factors", comm, verbose)
+    _log("Gathering row-distributed U", comm, verbose)
     U = _gather_distributed_u(U_local, comm).astype(work_dtype, copy=False)
 
     n_obs, n_vars = get_h5ad_shape(in_path)
     col_start, col_end = column_bounds(n_vars, mpi_rank, mpi_size)
+    _log(f"Read matrix with {n_obs} cells and {n_vars} genes", comm, verbose)
     input_block = _read_csc_column_block(in_path, col_start, col_end)
 
     vh_block = vh[:, col_start:col_end]
     recon_block = reconstruct_column_block(U, s, vh_block, dtype=recon_dtype)
+    _log("Computed low-rank reconstruction", comm, verbose)
 
     thresh_block = threshold_reconstruction_block(recon_block, quantile_prob)
+    _log("Thresholded low-rank reconstruction", comm, verbose)
     del recon_block
 
     to_scale, scale_factors, offsets = create_scaling_factors_block(thresh_block, input_block)
+    _log("Computed scaling factors", comm, verbose)
     imputed_block = apply_scaling_block(thresh_block, to_scale, scale_factors, offsets)
+
+    n_unscaled_local = np.array(np.sum(~to_scale), dtype=np.int64)
+    n_unscaled_total = np.array(0, dtype=np.int64)
+    comm.Allreduce(n_unscaled_local, n_unscaled_total, op=MPI.SUM)
+    _log(f"Scaled all except {int(n_unscaled_total)} genes", comm, verbose)
     del thresh_block
 
     imputed_block, n_neg = clip_negative_values_block(imputed_block)
+
+    n_neg_total = np.array(0, dtype=np.int64)
+    comm.Allreduce(np.array(n_neg, dtype=np.int64), n_neg_total, op=MPI.SUM)
+    denom = float(n_obs * n_vars)
+    neg_pct = 100.0 * int(n_neg_total) / denom if denom else 0.0
+    _log(f"{neg_pct:.2f}% of values became negative and were set to zero", comm, verbose)
+
     imputed_block = restore_observed_values_block(imputed_block, input_block)
+    _log("Restored observed values", comm, verbose)
 
     if report:
-        _report_distributed_density(input_block, imputed_block, n_neg, comm)
+        _report_distributed_density(input_block, imputed_block, n_neg, comm, verbose=verbose)
 
     return imputed_block, (col_start, col_end), s, vh_block, u_row_range
 
@@ -286,6 +327,7 @@ def impute_h5ad_parallel(
     recon_dtype=np.float32,
     output_dtype=np.float32,
     report: bool = True,
+    verbose: bool = True,
 ) -> None:
     """Run distributed HALRA imputation and write the imputed matrix to h5ad.
 
@@ -308,9 +350,12 @@ def impute_h5ad_parallel(
         work_dtype=work_dtype,
         recon_dtype=recon_dtype,
         report=report,
+        verbose=verbose,
     )
 
     n_obs, n_vars = get_h5ad_shape(in_path)
+
+    _log("Writing imputed matrix to h5ad", comm, verbose)
 
     write_h5ad_parallel_csc_from_column_blocks(
         in_path=in_path,
@@ -323,3 +368,4 @@ def impute_h5ad_parallel(
         data_dtype=output_dtype,
     )
 
+    _log("Wrote imputed matrix to h5ad", comm, verbose)
