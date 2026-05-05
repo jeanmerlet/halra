@@ -57,7 +57,7 @@ import anndata as ad
 from halra import halra
 
 # Load your AnnData object
-adata = ad.read_h5ad("your_data.h5ad")
+adata = ad.read_h5ad("anndata.h5ad")
 
 # Run HALRA
 adata_imputed = halra(adata, normalize=True)
@@ -66,6 +66,28 @@ adata_imputed = halra(adata, normalize=True)
 # adata_imputed.X now contains imputed values
 # All metadata (.obs, .var, etc.) is preserved (filtered if needed)
 ```
+
+
+## Usage Example (10x Matrix Market)
+
+```python
+import os
+import pandas as pd
+from scipy.io import mmread
+from halra import halra
+
+# Load 10x files
+mtx_dir = "/path/to/dir"
+matrix = mmread(os.path.join(mtx_dir, "matrix.mtx")).T
+features = pd.read_csv(os.path.join(mtx_dir, "features.tsv"), sep="\t", header=None, usecols=[0])
+barcodes = pd.read_csv(os.path.join(mtx_dir, "barcodes.tsv"), sep="\t", header=None)
+
+# Run HALRA
+imputed_matrix, cells, genes = halra(matrix, barcodes, features, normalize=True)
+
+# Result:
+# imputed_matrix contains imputed values
+# cells and genes contain the filtered cell/gene labels
 
 
 ## Dependency Notes
