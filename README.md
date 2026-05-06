@@ -38,18 +38,12 @@ data first or pass normalize=True to the halra function when imputing.
 
 ## Installation
 
-HALRA can be installed as a local pip package. First install Python v3.10. 
-Example:
+HALRA can be installed as a pip package but requires Python >= 3.10. Example:
 
 ``` bash
 conda create -n halra_env python=3.10
 conda activate halra_env
-```
-
-Then, git clone this repo and install HALRA locally:
-
-``` bash
-pip install -e .
+pip install halra
 ```
 
 

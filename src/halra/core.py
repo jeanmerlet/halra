@@ -160,17 +160,26 @@ def create_reconstruction(matrix, rank, n_iter, seed, verbose=True):
     return recon_matrix
 
 
-def threshold_reconstruction(recon_matrix, quantile_prob):
+def threshold_reconstruction(recon_matrix, quantile_prob, block_size=1000):
     """
     Threshold a dense reconstructed matrix by gene-wise quantiles.
 
-    Values less than or equal to the absolute quantile threshold for each column
-    are set to zero. The returned thresholded matrix is sparse CSC.
+    Processes genes in blocks to avoid creating a full dense boolean mask or
+    full dense thresholded copy. Returns sparse CSC.
     """
-    thresholds = np.abs(np.quantile(recon_matrix, quantile_prob, axis=0))
-    mask = recon_matrix > thresholds[np.newaxis, :]
-    thresh_matrix = sp.csc_matrix(recon_matrix * mask)
+    n_cells, n_genes = recon_matrix.shape
+    sparse_blocks = []
+
+    for start in range(0, n_genes, block_size):
+        end = min(start + block_size, n_genes)
+        block = recon_matrix[:, start:end]
+        thresholds = np.abs(np.quantile(block, quantile_prob, axis=0))
+        block[block <= thresholds[np.newaxis, :]] = 0
+        sparse_blocks.append(sp.csc_matrix(block))
+
+    thresh_matrix = sp.hstack(sparse_blocks, format="csc")
     thresh_matrix.eliminate_zeros()
+
     return thresh_matrix
 
 
